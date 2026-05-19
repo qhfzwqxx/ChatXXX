@@ -1039,6 +1039,8 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
     base_url: '',
     api_key: '',
     model: '',
+    request_mode: 'chat_completions',
+    response_format: '',
     is_default: true,
     is_visible: true,
     is_active: true
@@ -1054,7 +1056,17 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
         provider_type: 'openai_compatible',
         capabilities: '{"input":{"text":true},"output":{"text":true},"features":{"stream":true}}'
       });
-      setForm({ name: '', base_url: '', api_key: '', model: '', is_default: true, is_visible: true, is_active: true });
+      setForm({
+        name: '',
+        base_url: '',
+        api_key: '',
+        model: '',
+        request_mode: 'chat_completions',
+        response_format: '',
+        is_default: true,
+        is_visible: true,
+        is_active: true
+      });
       await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');
@@ -1072,6 +1084,23 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
         />
         <input placeholder="API Key" value={form.api_key} onChange={(event) => setForm({ ...form, api_key: event.target.value })} />
         <input placeholder="模型，例如 gpt-4o-mini" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} />
+        <label className="field-block">
+          请求接口
+          <select value={form.request_mode} onChange={(event) => setForm({ ...form, request_mode: event.target.value })}>
+            <option value="chat_completions">chat/completions</option>
+            <option value="responses">responses</option>
+          </select>
+        </label>
+        <label className="field-block">
+          response_format
+          <textarea
+            rows={4}
+            placeholder='例如 {"type":"json_schema","json_schema":{"name":"demo","strict":true,"schema":{"type":"object","properties":{}}}}'
+            value={form.response_format}
+            onChange={(event) => setForm({ ...form, response_format: event.target.value })}
+          />
+        </label>
+        <p className="field-help">`responses` 模式会把这里的 JSON 原样透传到 `text.format`；`chat/completions` 会透传到 `response_format`。</p>
         {error && <div className="error-line">{error}</div>}
         <button className="primary-btn" type="submit">
           保存 Provider
@@ -1083,6 +1112,8 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
             <strong>{provider.name}</strong>
             <span>{provider.model}</span>
             <small>{provider.base_url}</small>
+            <small>{provider.request_mode === 'responses' ? 'responses' : 'chat/completions'}</small>
+            {provider.response_format && <small>{provider.response_format}</small>}
           </div>
         ))}
         {!providers.length && <div className="empty-hint">暂无 Provider</div>}

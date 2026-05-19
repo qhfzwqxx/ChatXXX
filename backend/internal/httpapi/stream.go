@@ -39,12 +39,14 @@ type attachment struct {
 }
 
 type runtimeProvider struct {
-	ID     int64
-	Name   string
-	Base   string
-	Key    string
-	Model  string
-	Active bool
+	ID             int64
+	Name           string
+	Base           string
+	Key            string
+	Model          string
+	RequestMode    string
+	ResponseFormat string
+	Active         bool
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -98,7 +100,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		fullText = "这是 ChatXXX 的本地流式占位回复。你还没有配置可用的 OpenAI-compatible provider；请使用管理员账号到设置里添加模型。"
 		streamLocalText(w, fullText)
 	} else {
-		text, err := s.streamOpenAICompatible(w, *provider, req.ConversationID, user.ID, promptContent)
+		conversation, _ := s.getConversationForUser(req.ConversationID, user.ID)
+		text, err := s.streamOpenAICompatible(w, *provider, conversation, req.ConversationID, user.ID, promptContent)
 		if err != nil {
 			fullText = "模型调用失败：" + err.Error()
 			sendSSE(w, "error", map[string]interface{}{"code": "LLM_REQUEST_FAILED", "message": fullText})
@@ -279,7 +282,7 @@ func attachmentPromptText(raw string) string {
 }
 
 func (s *Server) getRuntimeProvider(id int64) (*runtimeProvider, error) {
-	query := `SELECT id, name, base_url, api_key, model, is_active FROM providers WHERE is_active=1`
+	query := `SELECT id, name, base_url, api_key, model, request_mode, response_format, is_active FROM providers WHERE is_active=1`
 	args := []interface{}{}
 	if id > 0 {
 		query += ` AND id=?`
@@ -290,20 +293,34 @@ func (s *Server) getRuntimeProvider(id int64) (*runtimeProvider, error) {
 	row := s.store.DB.QueryRow(query, args...)
 	var p runtimeProvider
 	var active int
-	if err := row.Scan(&p.ID, &p.Name, &p.Base, &p.Key, &p.Model, &active); err != nil {
+	if err := row.Scan(&p.ID, &p.Name, &p.Base, &p.Key, &p.Model, &p.RequestMode, &p.ResponseFormat, &active); err != nil {
 		return nil, err
 	}
 	p.Active = active == 1
 	return &p, nil
 }
 
-func (s *Server) streamOpenAICompatible(w http.ResponseWriter, provider runtimeProvider, conversationID, userID int64, latest string) (string, error) {
+func (s *Server) streamOpenAICompatible(w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string) (string, error) {
+	switch strings.TrimSpace(provider.RequestMode) {
+	case "", "chat_completions":
+		return s.streamChatCompletions(w, provider, conversation, conversationID, userID, latest)
+	case "responses":
+		return s.streamResponses(w, provider, conversation, conversationID, userID, latest)
+	default:
+		return "", fmt.Errorf("不支持的请求模式：%s", provider.RequestMode)
+	}
+}
+
+func (s *Server) streamChatCompletions(w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string) (string, error) {
 	messages, _ := s.listMessages(conversationID, userID)
 	type chatMessage struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	}
 	bodyMessages := make([]chatMessage, 0, len(messages)+1)
+	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
+		bodyMessages = append(bodyMessages, chatMessage{Role: "system", Content: strings.TrimSpace(conversation.SystemPrompt)})
+	}
 	for _, msg := range messages {
 		if msg.Role == "user" || msg.Role == "assistant" || msg.Role == "system" {
 			if content := messagePromptContent(msg); strings.TrimSpace(content) != "" {
@@ -318,6 +335,11 @@ func (s *Server) streamOpenAICompatible(w http.ResponseWriter, provider runtimeP
 		"model":    provider.Model,
 		"messages": bodyMessages,
 		"stream":   true,
+	}
+	if rf, ok, err := parseJSONObject(provider.ResponseFormat); err != nil {
+		return "", fmt.Errorf("response_format 配置无效：%w", err)
+	} else if ok {
+		requestBody["response_format"] = rf
 	}
 	raw, _ := json.Marshal(requestBody)
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(provider.Base, "/")+"/chat/completions", bytes.NewReader(raw))
@@ -335,10 +357,81 @@ func (s *Server) streamOpenAICompatible(w http.ResponseWriter, provider runtimeP
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
-	return readOpenAIStream(w, resp.Body), nil
+	return readChatCompletionsStream(w, resp.Body)
 }
 
-func readOpenAIStream(w http.ResponseWriter, body io.Reader) string {
+func (s *Server) streamResponses(w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string) (string, error) {
+	messages, _ := s.listMessages(conversationID, userID)
+	type responseContent struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	type responseInputMessage struct {
+		Role    string            `json:"role"`
+		Content []responseContent  `json:"content"`
+	}
+	input := make([]responseInputMessage, 0, len(messages)+1)
+	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
+		input = append(input, responseInputMessage{
+			Role: "system",
+			Content: []responseContent{
+				{Type: "input_text", Text: strings.TrimSpace(conversation.SystemPrompt)},
+			},
+		})
+	}
+	for _, msg := range messages {
+		if msg.Role == "user" || msg.Role == "assistant" || msg.Role == "system" {
+			if content := messagePromptContent(msg); strings.TrimSpace(content) != "" {
+				input = append(input, responseInputMessage{
+					Role: msg.Role,
+					Content: []responseContent{
+						{Type: "input_text", Text: content},
+					},
+				})
+			}
+		}
+	}
+	if len(input) == 0 && latest != "" {
+		input = append(input, responseInputMessage{
+			Role: "user",
+			Content: []responseContent{
+				{Type: "input_text", Text: latest},
+			},
+		})
+	}
+	requestBody := map[string]interface{}{
+		"model":  provider.Model,
+		"input":  input,
+		"stream": true,
+	}
+	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
+		requestBody["instructions"] = strings.TrimSpace(conversation.SystemPrompt)
+	}
+	if rf, ok, err := parseJSONObject(provider.ResponseFormat); err != nil {
+		return "", fmt.Errorf("response_format 配置无效：%w", err)
+	} else if ok {
+		requestBody["text"] = map[string]interface{}{"format": rf}
+	}
+	raw, _ := json.Marshal(requestBody)
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(provider.Base, "/")+"/responses", bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+provider.Key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return readResponsesStream(w, resp.Body)
+}
+
+func readChatCompletionsStream(w http.ResponseWriter, body io.Reader) (string, error) {
 	var full strings.Builder
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
@@ -372,7 +465,151 @@ func readOpenAIStream(w http.ResponseWriter, body io.Reader) string {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return full.String(), err
+	}
+	return full.String(), nil
+}
+
+func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) {
+	var full strings.Builder
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 1024), 1024*1024)
+	eventName := ""
+	var payload strings.Builder
+	flush := func() error {
+		name := strings.TrimSpace(eventName)
+		data := strings.TrimSpace(payload.String())
+		eventName = ""
+		payload.Reset()
+		if name == "" || data == "" {
+			return nil
+		}
+		switch name {
+		case "response.output_text.delta":
+			var event struct {
+				Delta string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				return nil
+			}
+			if event.Delta != "" {
+				full.WriteString(event.Delta)
+				sendSSE(w, "delta", map[string]interface{}{"text": event.Delta})
+			}
+		case "response.reasoning_summary_text.delta":
+			var event struct {
+				Delta string `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				return nil
+			}
+			if event.Delta != "" {
+				sendSSE(w, "thinking", map[string]interface{}{"text": event.Delta})
+			}
+		case "response.completed":
+			if full.Len() == 0 {
+				if text := extractResponseCompletedText(data); text != "" {
+					full.WriteString(text)
+					sendSSE(w, "delta", map[string]interface{}{"text": text})
+				}
+			}
+		case "error":
+			return parseResponseError(data)
+		}
+		return nil
+	}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.TrimSpace(line) == "" {
+			if err := flush(); err != nil {
+				return full.String(), err
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			if err := flush(); err != nil {
+				return full.String(), err
+			}
+			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			if payload.Len() > 0 {
+				payload.WriteByte('\n')
+			}
+			payload.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+	if err := flush(); err != nil {
+		return full.String(), err
+	}
+	if err := scanner.Err(); err != nil {
+		return full.String(), err
+	}
+	return full.String(), nil
+}
+
+func parseJSONObject(raw string) (map[string]interface{}, bool, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, false, nil
+	}
+	var value map[string]interface{}
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return nil, false, err
+	}
+	return value, true, nil
+}
+
+func extractResponseCompletedText(data string) string {
+	var event struct {
+		Response struct {
+			Output []struct {
+				Type    string `json:"type"`
+				Role    string `json:"role"`
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return ""
+	}
+	var full strings.Builder
+	for _, item := range event.Response.Output {
+		if item.Type != "message" && item.Role != "assistant" {
+			continue
+		}
+		for _, content := range item.Content {
+			if content.Type == "output_text" && content.Text != "" {
+				full.WriteString(content.Text)
+			}
+		}
+	}
 	return full.String()
+}
+
+func parseResponseError(data string) error {
+	var event struct {
+		Message string `json:"message"`
+		Error   struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return fmt.Errorf("provider stream error")
+	}
+	if strings.TrimSpace(event.Error.Message) != "" {
+		return fmt.Errorf("%s", strings.TrimSpace(event.Error.Message))
+	}
+	if strings.TrimSpace(event.Message) != "" {
+		return fmt.Errorf("%s", strings.TrimSpace(event.Message))
+	}
+	return fmt.Errorf("provider stream error")
 }
 
 var _ = sql.ErrNoRows

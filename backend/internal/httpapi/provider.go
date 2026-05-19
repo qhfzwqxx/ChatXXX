@@ -14,6 +14,8 @@ type Provider struct {
 	APIKey          string `json:"api_key,omitempty"`
 	Model           string `json:"model"`
 	Capabilities    string `json:"capabilities"`
+	RequestMode     string `json:"request_mode"`
+	ResponseFormat  string `json:"response_format"`
 	ContextWindow   int64  `json:"context_window"`
 	MaxOutputTokens int64  `json:"max_output_tokens"`
 	IsDefault       bool   `json:"is_default"`
@@ -28,6 +30,8 @@ type providerRequest struct {
 	APIKey          string `json:"api_key"`
 	Model           string `json:"model"`
 	Capabilities    string `json:"capabilities"`
+	RequestMode     string `json:"request_mode"`
+	ResponseFormat  string `json:"response_format"`
 	ContextWindow   int64  `json:"context_window"`
 	MaxOutputTokens int64  `json:"max_output_tokens"`
 	IsDefault       bool   `json:"is_default"`
@@ -37,7 +41,7 @@ type providerRequest struct {
 
 func (s *Server) handleProviderCapabilities(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.DB.Query(`
-		SELECT id, name, provider_type, base_url, model, capabilities, context_window, max_output_tokens, is_default, is_visible, is_active
+		SELECT id, name, provider_type, base_url, model, capabilities, request_mode, response_format, context_window, max_output_tokens, is_default, is_visible, is_active
 		FROM providers WHERE is_active = 1 AND is_visible = 1 ORDER BY is_default DESC, id ASC
 	`)
 	if err != nil {
@@ -50,7 +54,7 @@ func (s *Server) handleProviderCapabilities(w http.ResponseWriter, r *http.Reque
 	for rows.Next() {
 		var p Provider
 		var def, visible, active int
-		if err := rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &p.Model, &p.Capabilities, &p.ContextWindow, &p.MaxOutputTokens, &def, &visible, &active); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &p.Model, &p.Capabilities, &p.RequestMode, &p.ResponseFormat, &p.ContextWindow, &p.MaxOutputTokens, &def, &visible, &active); err != nil {
 			continue
 		}
 		p.IsDefault = def == 1
@@ -71,7 +75,7 @@ func (s *Server) handleProviderCapabilities(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) handleAdminListProviders(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.DB.Query(`
-		SELECT id, name, provider_type, base_url, model, capabilities, context_window, max_output_tokens, is_default, is_visible, is_active
+		SELECT id, name, provider_type, base_url, model, capabilities, request_mode, response_format, context_window, max_output_tokens, is_default, is_visible, is_active
 		FROM providers ORDER BY is_default DESC, id ASC
 	`)
 	if err != nil {
@@ -83,7 +87,7 @@ func (s *Server) handleAdminListProviders(w http.ResponseWriter, r *http.Request
 	for rows.Next() {
 		var p Provider
 		var def, visible, active int
-		_ = rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &p.Model, &p.Capabilities, &p.ContextWindow, &p.MaxOutputTokens, &def, &visible, &active)
+		_ = rows.Scan(&p.ID, &p.Name, &p.ProviderType, &p.BaseURL, &p.Model, &p.Capabilities, &p.RequestMode, &p.ResponseFormat, &p.ContextWindow, &p.MaxOutputTokens, &def, &visible, &active)
 		p.IsDefault = def == 1
 		p.IsVisible = visible == 1
 		p.IsActive = active == 1
@@ -108,9 +112,9 @@ func (s *Server) handleAdminCreateProvider(w http.ResponseWriter, r *http.Reques
 	}
 	now := db.Now()
 	res, err := s.store.DB.Exec(`
-		INSERT INTO providers (name, provider_type, base_url, api_key, model, capabilities, context_window, max_output_tokens, is_default, is_visible, is_active, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, p.Name, p.ProviderType, p.BaseURL, req.APIKey, p.Model, p.Capabilities, p.ContextWindow, p.MaxOutputTokens, boolInt(p.IsDefault), boolInt(p.IsVisible), boolInt(p.IsActive), now, now)
+		INSERT INTO providers (name, provider_type, base_url, api_key, model, capabilities, request_mode, response_format, context_window, max_output_tokens, is_default, is_visible, is_active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, p.Name, p.ProviderType, p.BaseURL, req.APIKey, p.Model, p.Capabilities, p.RequestMode, p.ResponseFormat, p.ContextWindow, p.MaxOutputTokens, boolInt(p.IsDefault), boolInt(p.IsVisible), boolInt(p.IsActive), now, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SERVER_ERROR", "保存模型失败")
 		return
@@ -136,9 +140,9 @@ func (s *Server) handleAdminUpdateProvider(w http.ResponseWriter, r *http.Reques
 		_, _ = s.store.DB.Exec(`UPDATE providers SET is_default = 0 WHERE id <> ?`, id)
 	}
 	_, err := s.store.DB.Exec(`
-		UPDATE providers SET name=?, provider_type=?, base_url=?, api_key=COALESCE(NULLIF(?, ''), api_key), model=?, capabilities=?, context_window=?, max_output_tokens=?, is_default=?, is_visible=?, is_active=?, updated_at=?
+		UPDATE providers SET name=?, provider_type=?, base_url=?, api_key=COALESCE(NULLIF(?, ''), api_key), model=?, capabilities=?, request_mode=?, response_format=?, context_window=?, max_output_tokens=?, is_default=?, is_visible=?, is_active=?, updated_at=?
 		WHERE id=?
-	`, p.Name, p.ProviderType, p.BaseURL, req.APIKey, p.Model, p.Capabilities, p.ContextWindow, p.MaxOutputTokens, boolInt(p.IsDefault), boolInt(p.IsVisible), boolInt(p.IsActive), db.Now(), id)
+	`, p.Name, p.ProviderType, p.BaseURL, req.APIKey, p.Model, p.Capabilities, p.RequestMode, p.ResponseFormat, p.ContextWindow, p.MaxOutputTokens, boolInt(p.IsDefault), boolInt(p.IsVisible), boolInt(p.IsActive), db.Now(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SERVER_ERROR", "更新模型失败")
 		return
@@ -166,6 +170,10 @@ func normalizeProvider(req providerRequest) Provider {
 	if providerType == "" {
 		providerType = "openai_compatible"
 	}
+	requestMode := strings.TrimSpace(req.RequestMode)
+	if requestMode == "" {
+		requestMode = "chat_completions"
+	}
 	caps := strings.TrimSpace(req.Capabilities)
 	if caps == "" {
 		caps = `{"input":{"text":true},"output":{"text":true},"features":{"stream":true}}`
@@ -176,6 +184,8 @@ func normalizeProvider(req providerRequest) Provider {
 		BaseURL:         strings.TrimRight(strings.TrimSpace(req.BaseURL), "/"),
 		Model:           strings.TrimSpace(req.Model),
 		Capabilities:    caps,
+		RequestMode:     requestMode,
+		ResponseFormat:  strings.TrimSpace(req.ResponseFormat),
 		ContextWindow:   req.ContextWindow,
 		MaxOutputTokens: req.MaxOutputTokens,
 		IsDefault:       req.IsDefault,

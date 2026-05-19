@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Added admin-side provider controls for OpenAI `chat/completions` vs `responses`, plus raw `response_format` passthrough.
 - Reworked the React chat frontend to closely match the original `/public/chat` UI: collapsible rail sidebar, old-style conversation list, model switcher, centered message stream, rounded composer, and user action menu.
 - Moved memories and provider settings into modal panels opened from the user menu, keeping the primary screen focused on chat.
 - Improved mobile layout parity with the original chat UI by using a drawer sidebar, overlay mask, constrained composer width, and stronger long-text wrapping.

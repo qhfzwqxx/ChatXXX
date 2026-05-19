@@ -14,6 +14,7 @@ chatxxx/
 The frontend talks to the backend through `/api/*`. In development, Vite proxies `/api` to the Go server.
 The development frontend listens on `0.0.0.0:5178`, so it can be opened from another browser with the server IP and port when firewall/security-group rules allow it.
 The chat UI lives at `/`, while the admin UI for provider/LLM settings lives at `/admin` and only accepts admin accounts.
+In the provider form, `request_mode` chooses between OpenAI `chat/completions` and `responses`; `response_format` is stored as raw JSON and forwarded to the chosen API shape.
 
 ## Backend
 

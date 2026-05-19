@@ -66,6 +66,8 @@ func (s *Store) migrate() error {
 			api_key TEXT NOT NULL,
 			model TEXT NOT NULL,
 			capabilities TEXT NOT NULL DEFAULT '{}',
+			request_mode TEXT NOT NULL DEFAULT 'chat_completions',
+			response_format TEXT NOT NULL DEFAULT '',
 			context_window INTEGER NOT NULL DEFAULT 0,
 			max_output_tokens INTEGER NOT NULL DEFAULT 0,
 			is_default INTEGER NOT NULL DEFAULT 0,
@@ -150,5 +152,34 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
+	if err := s.ensureColumn("providers", "request_mode", "TEXT NOT NULL DEFAULT 'chat_completions'"); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("providers", "response_format", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureColumn(table, column, definition string) error {
+	rows, err := s.DB.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notnull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notnull, &dflt, &pk); err != nil {
+			continue
+		}
+		if name == column {
+			return nil
+		}
+	}
+	_, err = s.DB.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition)
+	return err
 }

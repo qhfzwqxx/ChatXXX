@@ -14,6 +14,8 @@ export type Provider = {
   api_key?: string;
   model: string;
   capabilities: string;
+  request_mode: string;
+  response_format: string;
   context_window: number;
   max_output_tokens: number;
   is_default: boolean;

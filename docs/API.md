@@ -35,6 +35,10 @@ Errors use:
 - `DELETE /api/admin/providers/{id}`
 
 Providers are OpenAI-compatible by default.
+Provider config also supports:
+
+- `request_mode`: `chat_completions` or `responses`
+- `response_format`: raw JSON object to pass through as `response_format` for `chat_completions`, or `text.format` for `responses`
 
 ## Conversations
 
