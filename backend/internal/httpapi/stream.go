@@ -15,6 +15,11 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	streamDeltaChunkRunes = 4
+	streamDeltaDelay      = 55 * time.Millisecond
+)
+
 type streamRequest struct {
 	ConversationID int64         `json:"conversation_id"`
 	Content        string        `json:"content"`
@@ -188,15 +193,19 @@ func sendSSE(w http.ResponseWriter, event string, data interface{}) {
 }
 
 func streamLocalText(w http.ResponseWriter, text string) {
+	streamDeltaText(w, text)
+}
+
+func streamDeltaText(w http.ResponseWriter, text string) {
 	runes := []rune(text)
-	for i := 0; i < len(runes); i += 5 {
-		end := i + 5
+	for i := 0; i < len(runes); i += streamDeltaChunkRunes {
+		end := i + streamDeltaChunkRunes
 		if end > len(runes) {
 			end = len(runes)
 		}
 		chunk := string(runes[i:end])
 		sendSSE(w, "delta", map[string]interface{}{"text": chunk})
-		time.Sleep(35 * time.Millisecond)
+		time.Sleep(streamDeltaDelay)
 	}
 }
 
@@ -359,7 +368,7 @@ func readOpenAIStream(w http.ResponseWriter, body io.Reader) string {
 			}
 			if choice.Delta.Content != "" {
 				full.WriteString(choice.Delta.Content)
-				sendSSE(w, "delta", map[string]interface{}{"text": choice.Delta.Content})
+				streamDeltaText(w, choice.Delta.Content)
 			}
 		}
 	}
