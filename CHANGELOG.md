@@ -10,6 +10,7 @@
 - Updated composer controls to use the old-style circular arrow send button and black square stop button during streaming.
 - Added per-message action buttons: assistant messages can be copied or regenerated, and user messages can be copied or edited inline.
 - Implemented backend stream modes for regeneration and user-message editing so retries truncate old follow-up messages and persist the new answer.
+- Split the app into `/` for chat and `/admin` for admin-only provider/LLM configuration.
 
 ## 0.1.0 - 2026-05-19
 
