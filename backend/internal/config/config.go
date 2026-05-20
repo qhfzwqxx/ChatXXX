@@ -8,21 +8,29 @@ import (
 )
 
 type Config struct {
-	Port          string
-	DBPath        string
-	SessionSecret string
-	CORSOrigin    string
-	AppEnv        string
+	Port            string
+	DBPath          string
+	SessionSecret   string
+	CORSOrigin      string
+	AppEnv          string
+	UniFuncsAPIKey  string
+	UniFuncsBaseURL string
 }
 
 func Load() Config {
 	loadDotEnv(".env")
+	if backendEnv := backendEnvPath(); backendEnv != "" {
+		loadDotEnv(backendEnv)
+	}
+	baseDir := backendBaseDir()
 	return Config{
-		Port:          env("APP_PORT", "8007"),
-		DBPath:        env("DB_PATH", "../data/chatxxx.sqlite"),
-		SessionSecret: env("SESSION_SECRET", "dev-secret-change-me"),
-		CORSOrigin:    env("CORS_ORIGIN", "http://127.0.0.1:5178"),
-		AppEnv:        env("APP_ENV", "development"),
+		Port:            env("APP_PORT", "8007"),
+		DBPath:          resolvePath(env("DB_PATH", "../data/chatxxx.sqlite"), baseDir),
+		SessionSecret:   env("SESSION_SECRET", "dev-secret-change-me"),
+		CORSOrigin:      env("CORS_ORIGIN", "http://127.0.0.1:5178"),
+		AppEnv:          env("APP_ENV", "development"),
+		UniFuncsAPIKey:  env("UNIFUNCS_API_KEY", ""),
+		UniFuncsBaseURL: env("UNIFUNCS_BASE_URL", "https://api.unifuncs.com"),
 	}
 }
 
@@ -56,6 +64,29 @@ func loadDotEnv(path string) {
 			_ = os.Setenv(key, value)
 		}
 	}
+}
+
+func backendEnvPath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(exe), "..", ".env"))
+}
+
+func backendBaseDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(exe), ".."))
+}
+
+func resolvePath(path, baseDir string) string {
+	if filepath.IsAbs(path) || strings.TrimSpace(baseDir) == "" {
+		return path
+	}
+	return filepath.Clean(filepath.Join(baseDir, path))
 }
 
 func EnsureDirForFile(path string) error {

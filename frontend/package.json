@@ -4,15 +4,21 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 0.0.0.0 --port 5178",
+    "dev": "vite preview --host 0.0.0.0 --port 5178",
+    "dev:hot": "vite --host 0.0.0.0 --port 5178",
     "build": "tsc && vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 4178"
+    "preview": "vite preview --host 0.0.0.0 --port 5178"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.1.1",
+    "katex": "^0.16.47",
     "lucide-react": "^0.555.0",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
+    "react-markdown": "^10.1.0",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
     "typescript": "^5.9.3",
     "vite": "^7.2.4"
   },

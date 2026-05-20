@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"chatxxx/backend/internal/db"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -16,9 +19,23 @@ import (
 )
 
 const (
-	streamDeltaChunkRunes = 4
-	streamDeltaDelay      = 55 * time.Millisecond
+	streamDeltaChunkRunes  = 4
+	streamDeltaDelay       = 55 * time.Millisecond
+	maxResponsesToolRounds = 8
+
+	defaultWebReaderMaxWords = 12000
+	maxWebReaderMaxWords     = 5000000
+	maxWebReaderOutputRunes  = 60000
+	maxSearchingOutputRunes  = 60000
 )
+
+const responsesBaseToolInstruction = "You have local tools available in this chat runtime. Do not say you lack tools when the user asks for current web information or asks you to use an available tool; call the appropriate tool instead."
+
+const responsesUniFuncsToolInstruction = responsesBaseToolInstruction + "\n\nCurrent web tool mode: UniFuncs. Available web tools are web_search and web_reader. The searching tool is not available in this mode.\n\nFor web_search, infer the user's real intent before calling the tool. If the wording is misspelled, transliterated, abbreviated, or mixed-language, resolve it to the most likely real-world person, place, event, product, or topic in your own reasoning, then search that intended target. Do not mechanically copy the user's raw text into the query. Ask for clarification only when multiple interpretations are equally plausible or the target cannot be inferred with reasonable confidence.\n\nFor web_reader, call it when there is a concrete URL to read, including URLs returned by web_search. Prefer format=markdown unless plain text is specifically better.\n\nFor web/current/research questions, prefer the combined workflow whenever useful: first call web_search to discover candidate pages, then call web_reader on the most relevant 1 to 3 result URLs before giving the final answer. Use this search-then-read workflow especially for news, recent facts, product/company/person details, documentation lookups, and any answer that benefits from page-level evidence."
+
+const responsesSearchingToolInstruction = responsesBaseToolInstruction + "\n\nCurrent web tool mode: Searching. The only available web search tool is searching. web_search and web_reader are not available in this mode.\n\nFor web/current/research questions, call searching with a concise query and use the returned content as the browsing/search evidence before giving the final answer."
+
+var errGenerationStopped = errors.New("generation stopped")
 
 type streamRequest struct {
 	ConversationID int64         `json:"conversation_id"`
@@ -38,6 +55,66 @@ type attachment struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type responseInputContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+type responseOutputContent struct {
+	Type        string        `json:"type"`
+	Text        string        `json:"text"`
+	Annotations []interface{} `json:"annotations"`
+	Logprobs    []interface{} `json:"logprobs"`
+}
+
+type responseInputMessage struct {
+	Type    string      `json:"type"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"`
+	Status  string      `json:"status,omitempty"`
+	ID      string      `json:"id,omitempty"`
+}
+
+type responseOutputItem struct {
+	Type      string                  `json:"type"`
+	ID        string                  `json:"id,omitempty"`
+	CallID    string                  `json:"call_id,omitempty"`
+	Name      string                  `json:"name,omitempty"`
+	Arguments string                  `json:"arguments,omitempty"`
+	Role      string                  `json:"role,omitempty"`
+	Status    string                  `json:"status,omitempty"`
+	Content   []responseOutputContent `json:"content,omitempty"`
+}
+
+type responseFunctionCallOutput struct {
+	Type   string `json:"type"`
+	CallID string `json:"call_id"`
+	Output string `json:"output"`
+}
+
+type responseToolCall struct {
+	ID        string
+	CallID    string
+	Name      string
+	Arguments string
+}
+
+type responseToolStep struct {
+	Name          string `json:"name"`
+	CallID        string `json:"call_id"`
+	Status        string `json:"status"`
+	Arguments     string `json:"arguments,omitempty"`
+	Output        string `json:"output,omitempty"`
+	Timestamp     string `json:"timestamp"`
+	ContentOffset int    `json:"content_offset"`
+}
+
+type responsesRoundResult struct {
+	Text      string
+	Output    []responseOutputItem
+	ToolCalls []responseToolCall
+}
+
 type runtimeProvider struct {
 	ID             int64
 	Name           string
@@ -51,6 +128,7 @@ type runtimeProvider struct {
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
+	generationCtx := context.Background()
 	var req streamRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_JSON", "请求体必须是 JSON")
@@ -96,13 +174,22 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	provider, _ := s.getRuntimeProvider(req.ProviderID)
 	promptContent := strings.TrimSpace(userMessage.Content)
 	var fullText string
+	toolSteps := make([]responseToolStep, 0)
+	stopped := false
 	if provider == nil || provider.Key == "" || provider.Base == "" || provider.Model == "" {
 		fullText = "这是 ChatXXX 的本地流式占位回复。你还没有配置可用的 OpenAI-compatible provider；请使用管理员账号到设置里添加模型。"
-		streamLocalText(w, fullText)
+		text, err := streamLocalText(generationCtx, w, fullText, func() bool { return s.isGenerationStopping(runID, user.ID) })
+		fullText = text
+		stopped = errors.Is(err, errGenerationStopped)
 	} else {
 		conversation, _ := s.getConversationForUser(req.ConversationID, user.ID)
-		text, err := s.streamOpenAICompatible(w, *provider, conversation, req.ConversationID, user.ID, promptContent)
-		if err != nil {
+		text, err := s.streamOpenAICompatible(generationCtx, w, *provider, conversation, req.ConversationID, user.ID, promptContent, &toolSteps, func() bool {
+			return s.isGenerationStopping(runID, user.ID)
+		})
+		if errors.Is(err, errGenerationStopped) {
+			fullText = text
+			stopped = true
+		} else if err != nil {
 			fullText = "模型调用失败：" + err.Error()
 			sendSSE(w, "error", map[string]interface{}{"code": "LLM_REQUEST_FAILED", "message": fullText})
 		} else {
@@ -110,19 +197,35 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if strings.TrimSpace(fullText) == "" {
+	if s.isGenerationStopping(runID, user.ID) {
+		stopped = true
+	}
+	if stopped {
+		if stoppedContent, ok := s.stoppedMessageContent(assistant.ID, user.ID); ok && strings.TrimSpace(stoppedContent) != "" {
+			fullText = stoppedContent
+		}
+	}
+	if strings.TrimSpace(fullText) == "" && stopped {
+		fullText = "已停止生成"
+	} else if strings.TrimSpace(fullText) == "" {
 		fullText = "没有收到模型输出。"
 	}
-	s.updateMessageContent(assistant.ID, fullText, "completed")
-	_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status='completed', updated_at=? WHERE run_id=?`, db.Now(), runID)
+	assistantMetadata := assistantMetadataWithToolSteps(toolSteps)
+	finalStatus := "completed"
+	if stopped {
+		finalStatus = "stopped"
+	}
+	s.updateMessageContentWithMetadata(assistant.ID, fullText, finalStatus, assistantMetadata)
+	_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status=?, updated_at=? WHERE run_id=?`, finalStatus, db.Now(), runID)
 	if promptContent != "" {
 		_, _ = s.store.DB.Exec(`UPDATE conversations SET title = CASE WHEN title='新对话' THEN ? ELSE title END, updated_at=? WHERE id=? AND user_id=?`, titleFromContent(promptContent), db.Now(), req.ConversationID, user.ID)
 		sendSSE(w, "conversation_title", map[string]interface{}{"conversation_id": req.ConversationID, "title": titleFromContent(promptContent)})
 	}
 	assistant.Content = fullText
-	assistant.Status = "completed"
+	assistant.Status = finalStatus
+	assistant.Metadata = assistantMetadata
 	sendSSE(w, "message_end", map[string]interface{}{"message": assistant})
-	sendSSE(w, "done", map[string]interface{}{"ok": true})
+	sendSSE(w, "done", map[string]interface{}{"ok": !stopped, "status": finalStatus})
 }
 
 func (s *Server) prepareUserMessageForStream(conversationID, userID int64, content, mode string, messageID int64, metadata, attachments string) (Message, error) {
@@ -169,14 +272,46 @@ func (s *Server) prepareUserMessageForStream(conversationID, userID int64, conte
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r)
 	var req struct {
-		RunID string `json:"run_id"`
+		RunID              string `json:"run_id"`
+		AssistantMessageID int64  `json:"assistant_message_id"`
+		Content            string `json:"content"`
 	}
 	_ = readJSON(r, &req)
 	if strings.TrimSpace(req.RunID) != "" {
-		_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status='stopping', updated_at=? WHERE run_id=?`, db.Now(), req.RunID)
+		_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status='stopping', updated_at=? WHERE run_id=? AND user_id=?`, db.Now(), req.RunID, user.ID)
+		if req.AssistantMessageID <= 0 {
+			_ = s.store.DB.QueryRow(`SELECT assistant_message_id FROM generation_runs WHERE run_id=? AND user_id=?`, req.RunID, user.ID).Scan(&req.AssistantMessageID)
+		}
+	}
+	if req.AssistantMessageID > 0 {
+		content := req.Content
+		if strings.TrimSpace(content) == "" {
+			content = "已停止生成"
+		}
+		_, _ = s.store.DB.Exec(`UPDATE messages SET content=?, status='stopped', updated_at=? WHERE id=? AND user_id=? AND role='assistant'`, content, db.Now(), req.AssistantMessageID, user.ID)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+}
+
+func (s *Server) isGenerationStopping(runID string, userID int64) bool {
+	if strings.TrimSpace(runID) == "" {
+		return false
+	}
+	var status string
+	if err := s.store.DB.QueryRow(`SELECT status FROM generation_runs WHERE run_id=? AND user_id=?`, runID, userID).Scan(&status); err != nil {
+		return false
+	}
+	return status == "stopping" || status == "stopped"
+}
+
+func (s *Server) stoppedMessageContent(messageID, userID int64) (string, bool) {
+	var content, status string
+	if err := s.store.DB.QueryRow(`SELECT content, status FROM messages WHERE id=? AND user_id=? AND role='assistant'`, messageID, userID).Scan(&content, &status); err != nil {
+		return "", false
+	}
+	return content, status == "stopped"
 }
 
 func startSSE(w http.ResponseWriter) {
@@ -195,21 +330,38 @@ func sendSSE(w http.ResponseWriter, event string, data interface{}) {
 	}
 }
 
-func streamLocalText(w http.ResponseWriter, text string) {
-	streamDeltaText(w, text)
+func streamLocalText(ctx context.Context, w http.ResponseWriter, text string, shouldStop func() bool) (string, error) {
+	return streamDeltaText(ctx, w, text, shouldStop)
 }
 
-func streamDeltaText(w http.ResponseWriter, text string) {
+func streamDeltaText(ctx context.Context, w http.ResponseWriter, text string, shouldStop func() bool) (string, error) {
+	var full strings.Builder
 	runes := []rune(text)
 	for i := 0; i < len(runes); i += streamDeltaChunkRunes {
+		if streamShouldStop(ctx, shouldStop) {
+			return full.String(), errGenerationStopped
+		}
 		end := i + streamDeltaChunkRunes
 		if end > len(runes) {
 			end = len(runes)
 		}
 		chunk := string(runes[i:end])
+		full.WriteString(chunk)
 		sendSSE(w, "delta", map[string]interface{}{"text": chunk})
 		time.Sleep(streamDeltaDelay)
 	}
+	return full.String(), nil
+}
+
+func streamShouldStop(ctx context.Context, shouldStop func() bool) bool {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return true
+		default:
+		}
+	}
+	return shouldStop != nil && shouldStop()
 }
 
 func referencesMetadata(refs []interface{}) string {
@@ -300,18 +452,18 @@ func (s *Server) getRuntimeProvider(id int64) (*runtimeProvider, error) {
 	return &p, nil
 }
 
-func (s *Server) streamOpenAICompatible(w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string) (string, error) {
+func (s *Server) streamOpenAICompatible(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string, toolSteps *[]responseToolStep, shouldStop func() bool) (string, error) {
 	switch strings.TrimSpace(provider.RequestMode) {
 	case "", "chat_completions":
-		return s.streamChatCompletions(w, provider, conversation, conversationID, userID, latest)
+		return s.streamChatCompletions(ctx, w, provider, conversation, conversationID, userID, latest, shouldStop)
 	case "responses":
-		return s.streamResponses(w, provider, conversation, conversationID, userID, latest)
+		return s.streamResponses(ctx, w, provider, conversation, conversationID, userID, latest, toolSteps, shouldStop)
 	default:
 		return "", fmt.Errorf("不支持的请求模式：%s", provider.RequestMode)
 	}
 }
 
-func (s *Server) streamChatCompletions(w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string) (string, error) {
+func (s *Server) streamChatCompletions(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string, shouldStop func() bool) (string, error) {
 	messages, _ := s.listMessages(conversationID, userID)
 	type chatMessage struct {
 		Role    string `json:"role"`
@@ -342,7 +494,7 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, provider runtimePr
 		requestBody["response_format"] = rf
 	}
 	raw, _ := json.Marshal(requestBody)
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(provider.Base, "/")+"/chat/completions", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(provider.Base, "/")+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		return "", err
 	}
@@ -357,85 +509,281 @@ func (s *Server) streamChatCompletions(w http.ResponseWriter, provider runtimePr
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
-	return readChatCompletionsStream(w, resp.Body)
+	return readChatCompletionsStream(ctx, w, resp.Body, shouldStop)
 }
 
-func (s *Server) streamResponses(w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string) (string, error) {
+func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string, toolSteps *[]responseToolStep, shouldStop func() bool) (string, error) {
 	messages, _ := s.listMessages(conversationID, userID)
-	type responseContent struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	type responseInputMessage struct {
-		Role    string            `json:"role"`
-		Content []responseContent  `json:"content"`
-	}
-	input := make([]responseInputMessage, 0, len(messages)+1)
-	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
-		input = append(input, responseInputMessage{
-			Role: "system",
-			Content: []responseContent{
-				{Type: "input_text", Text: strings.TrimSpace(conversation.SystemPrompt)},
-			},
-		})
-	}
-	for _, msg := range messages {
-		if msg.Role == "user" || msg.Role == "assistant" || msg.Role == "system" {
-			if content := messagePromptContent(msg); strings.TrimSpace(content) != "" {
-				input = append(input, responseInputMessage{
-					Role: msg.Role,
-					Content: []responseContent{
-						{Type: "input_text", Text: content},
-					},
-				})
+	input := buildResponsesInput(messages, latest)
+	mode := s.searchToolMode()
+	tools := responseToolDefinitions(mode)
+	var full strings.Builder
+	for round := 0; round < maxResponsesToolRounds; round++ {
+		result, err := s.readResponsesRound(ctx, w, provider, conversation, input, tools, mode, shouldStop)
+		if err != nil {
+			return full.String(), err
+		}
+		if result.Text != "" {
+			full.WriteString(result.Text)
+		}
+		if streamShouldStop(ctx, shouldStop) {
+			return full.String(), errGenerationStopped
+		}
+		for _, item := range result.Output {
+			input = append(input, item)
+		}
+		if len(result.ToolCalls) == 0 {
+			return full.String(), nil
+		}
+		for _, call := range result.ToolCalls {
+			if streamShouldStop(ctx, shouldStop) {
+				return full.String(), errGenerationStopped
 			}
+			offset := len([]rune(full.String()))
+			running := responseToolStep{
+				Name:          call.Name,
+				CallID:        call.CallID,
+				Status:        "running",
+				Arguments:     call.Arguments,
+				Timestamp:     db.Now(),
+				ContentOffset: offset,
+			}
+			sendToolStep(w, running)
+			appendToolStep(toolSteps, running)
+			output := s.executeResponseTool(call, mode)
+			if streamShouldStop(ctx, shouldStop) {
+				return full.String(), errGenerationStopped
+			}
+			completed := responseToolStep{
+				Name:          call.Name,
+				CallID:        call.CallID,
+				Status:        "completed",
+				Arguments:     call.Arguments,
+				Output:        output,
+				Timestamp:     db.Now(),
+				ContentOffset: offset,
+			}
+			sendToolStep(w, completed)
+			appendToolStep(toolSteps, completed)
+			input = append(input, responseFunctionCallOutput{
+				Type:   "function_call_output",
+				CallID: call.CallID,
+				Output: output,
+			})
 		}
 	}
-	if len(input) == 0 && latest != "" {
+	return full.String(), fmt.Errorf("工具调用次数过多")
+}
+
+func responseMessageForInput(msg Message, content string) responseInputMessage {
+	if msg.Role == "assistant" {
+		return responseInputMessage{
+			Type:   "message",
+			Role:   "assistant",
+			Status: "completed",
+			ID:     fmt.Sprintf("msg_%d", msg.ID),
+			Content: []responseOutputContent{
+				{Type: "output_text", Text: content, Annotations: []interface{}{}, Logprobs: []interface{}{}},
+			},
+		}
+	}
+	return responseInputMessage{
+		Type: "message",
+		Role: msg.Role,
+		Content: []responseInputContent{
+			{Type: "input_text", Text: content},
+		},
+	}
+}
+
+func buildResponsesInput(messages []Message, latest string) []interface{} {
+	input := make([]interface{}, 0, len(messages)+1)
+	for _, msg := range messages {
+		if msg.Role != "user" && msg.Role != "assistant" && msg.Role != "system" {
+			continue
+		}
+		content := messagePromptContent(msg)
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		input = append(input, responseMessageForInput(msg, content))
+	}
+	if len(input) == 0 && strings.TrimSpace(latest) != "" {
 		input = append(input, responseInputMessage{
+			Type: "message",
 			Role: "user",
-			Content: []responseContent{
+			Content: []responseInputContent{
 				{Type: "input_text", Text: latest},
 			},
 		})
 	}
-	requestBody := map[string]interface{}{
-		"model":  provider.Model,
-		"input":  input,
-		"stream": true,
+	return input
+}
+
+func responseToolDefinitions(mode string) []map[string]interface{} {
+	tools := []map[string]interface{}{
+		{
+			"type":        "function",
+			"name":        "get_current_time",
+			"description": "Get the current time for an optional IANA timezone.",
+			"parameters": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"timezone": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional IANA timezone name such as Asia/Shanghai.",
+					},
+				},
+				"required":             []string{},
+				"additionalProperties": false,
+			},
+		},
 	}
+	if normalizeSearchToolMode(mode) == searchToolModeSearching {
+		return append(tools, map[string]interface{}{
+			"type":        "function",
+			"name":        "searching",
+			"description": "Call the configured web-enabled search LLM API and return its complete search answer as tool result data. Use this for web/current/research questions when Searching mode is active.",
+			"parameters": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"query": map[string]interface{}{
+						"type":        "string",
+						"description": "Concise web search query or research question.",
+					},
+				},
+				"required":             []string{"query"},
+				"additionalProperties": false,
+			},
+		})
+	}
+	return append(tools,
+		map[string]interface{}{
+			"type":        "function",
+			"name":        "web_search",
+			"description": "Search the web for current information through the configured UniFuncs Web Search API. Use this first for web/current/research questions to discover candidate pages, then usually follow with web_reader on the most relevant result URLs. First infer the user's intended target or topic from the conversation, then form the most appropriate search query. Do not just echo the user's raw wording when it is noisy, misspelled, transliterated, abbreviated, or mixed-language.",
+			"parameters": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"query": map[string]interface{}{
+						"type":        "string",
+						"description": "Semantic search query chosen after resolving the user's intended target or topic.",
+					},
+					"freshness": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional freshness filter supported by UniFuncs, such as Day, Week, or Month.",
+					},
+					"include_images": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Whether to include image results.",
+					},
+					"page": map[string]interface{}{
+						"type":        "integer",
+						"description": "Result page number, starting from 1.",
+					},
+					"count": map[string]interface{}{
+						"type":        "integer",
+						"description": "Number of web results to request.",
+					},
+				},
+				"required":             []string{"query"},
+				"additionalProperties": false,
+			},
+		},
+		map[string]interface{}{
+			"type":        "function",
+			"name":        "web_reader",
+			"description": "Read a specific webpage URL through the configured UniFuncs Web Reader API and return extracted page content. Use this after web_search to read the most relevant result URLs before answering, or directly when the user provides a concrete URL.",
+			"parameters": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"url": map[string]interface{}{
+						"type":        "string",
+						"description": "The absolute webpage URL to read.",
+					},
+					"format": map[string]interface{}{
+						"type":        "string",
+						"description": "Output format requested from UniFuncs. Use md or markdown for Markdown, text or txt for plain text.",
+						"enum":        []string{"markdown", "md", "text", "txt"},
+					},
+					"lite_mode": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Whether to enable UniFuncs liteMode for faster, lighter extraction.",
+					},
+					"include_images": map[string]interface{}{
+						"type":        "boolean",
+						"description": "Whether extracted Markdown should keep image references when available.",
+					},
+					"max_words": map[string]interface{}{
+						"type":        "integer",
+						"description": "Maximum words requested from UniFuncs before local output trimming.",
+					},
+					"topic": map[string]interface{}{
+						"type":        "string",
+						"description": "Optional topic hint for extracting the most relevant content from the page.",
+					},
+				},
+				"required":             []string{"url"},
+				"additionalProperties": false,
+			},
+		},
+	)
+}
+
+func responseToolInstructions(mode string) string {
+	if normalizeSearchToolMode(mode) == searchToolModeSearching {
+		return responsesSearchingToolInstruction
+	}
+	return responsesUniFuncsToolInstruction
+}
+
+func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, input []interface{}, tools []map[string]interface{}, mode string, shouldStop func() bool) (responsesRoundResult, error) {
+	requestBody := map[string]interface{}{
+		"model":       provider.Model,
+		"input":       input,
+		"stream":      true,
+		"tool_choice": "auto",
+		"tools":       tools,
+	}
+	instructions := responseToolInstructions(mode)
 	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
-		requestBody["instructions"] = strings.TrimSpace(conversation.SystemPrompt)
+		instructions = instructions + "\n\n" + strings.TrimSpace(conversation.SystemPrompt)
+	}
+	if strings.TrimSpace(instructions) != "" {
+		requestBody["instructions"] = instructions
 	}
 	if rf, ok, err := parseJSONObject(provider.ResponseFormat); err != nil {
-		return "", fmt.Errorf("response_format 配置无效：%w", err)
+		return responsesRoundResult{}, fmt.Errorf("response_format 配置无效：%w", err)
 	} else if ok {
 		requestBody["text"] = map[string]interface{}{"format": rf}
 	}
 	raw, _ := json.Marshal(requestBody)
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(provider.Base, "/")+"/responses", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(provider.Base, "/")+"/responses", bytes.NewReader(raw))
 	if err != nil {
-		return "", err
+		return responsesRoundResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+provider.Key)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", err
+		return responsesRoundResult{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return responsesRoundResult{}, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
-	return readResponsesStream(w, resp.Body)
+	return readResponsesStream(ctx, w, resp.Body, shouldStop)
 }
 
-func readChatCompletionsStream(w http.ResponseWriter, body io.Reader) (string, error) {
+func readChatCompletionsStream(ctx context.Context, w http.ResponseWriter, body io.Reader, shouldStop func() bool) (string, error) {
 	var full strings.Builder
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	for scanner.Scan() {
+		if streamShouldStop(ctx, shouldStop) {
+			return full.String(), errGenerationStopped
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if !strings.HasPrefix(line, "data:") {
 			continue
@@ -460,8 +808,11 @@ func readChatCompletionsStream(w http.ResponseWriter, body io.Reader) (string, e
 				sendSSE(w, "thinking", map[string]interface{}{"text": choice.Delta.ReasoningContent})
 			}
 			if choice.Delta.Content != "" {
-				full.WriteString(choice.Delta.Content)
-				streamDeltaText(w, choice.Delta.Content)
+				sent, err := streamDeltaText(ctx, w, choice.Delta.Content, shouldStop)
+				full.WriteString(sent)
+				if err != nil {
+					return full.String(), err
+				}
 			}
 		}
 	}
@@ -471,8 +822,11 @@ func readChatCompletionsStream(w http.ResponseWriter, body io.Reader) (string, e
 	return full.String(), nil
 }
 
-func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) {
+func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Reader, shouldStop func() bool) (responsesRoundResult, error) {
 	var full strings.Builder
+	result := responsesRoundResult{}
+	outputItems := make([]responseOutputItem, 0)
+	outputItemByID := map[string]int{}
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
 	eventName := ""
@@ -486,6 +840,14 @@ func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) 
 			return nil
 		}
 		switch name {
+		case "response.output_item.added", "response.output_item.done":
+			var event struct {
+				Item responseOutputItem `json:"item"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				return nil
+			}
+			upsertResponseOutputItem(&outputItems, outputItemByID, event.Item)
 		case "response.output_text.delta":
 			var event struct {
 				Delta string `json:"delta"`
@@ -494,8 +856,11 @@ func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) 
 				return nil
 			}
 			if event.Delta != "" {
-				full.WriteString(event.Delta)
-				sendSSE(w, "delta", map[string]interface{}{"text": event.Delta})
+				sent, err := streamDeltaText(ctx, w, event.Delta, shouldStop)
+				full.WriteString(sent)
+				if err != nil {
+					return err
+				}
 			}
 		case "response.reasoning_summary_text.delta":
 			var event struct {
@@ -508,11 +873,16 @@ func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) 
 				sendSSE(w, "thinking", map[string]interface{}{"text": event.Delta})
 			}
 		case "response.completed":
-			if full.Len() == 0 {
-				if text := extractResponseCompletedText(data); text != "" {
-					full.WriteString(text)
-					sendSSE(w, "delta", map[string]interface{}{"text": text})
+			completed := parseResponseCompleted(data)
+			if full.Len() == 0 && completed.Text != "" {
+				sent, err := streamDeltaText(ctx, w, completed.Text, shouldStop)
+				full.WriteString(sent)
+				if err != nil {
+					return err
 				}
+			}
+			for _, item := range completed.Output {
+				upsertResponseOutputItem(&outputItems, outputItemByID, item)
 			}
 		case "error":
 			return parseResponseError(data)
@@ -523,13 +893,19 @@ func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) 
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
 			if err := flush(); err != nil {
-				return full.String(), err
+				return responsesRoundResult{Text: full.String(), Output: result.Output, ToolCalls: result.ToolCalls}, err
+			}
+			if streamShouldStop(ctx, shouldStop) {
+				return responsesRoundResult{Text: full.String(), Output: result.Output, ToolCalls: result.ToolCalls}, errGenerationStopped
 			}
 			continue
 		}
 		if strings.HasPrefix(line, "event:") {
 			if err := flush(); err != nil {
-				return full.String(), err
+				return responsesRoundResult{Text: full.String(), Output: result.Output, ToolCalls: result.ToolCalls}, err
+			}
+			if streamShouldStop(ctx, shouldStop) {
+				return responsesRoundResult{Text: full.String(), Output: result.Output, ToolCalls: result.ToolCalls}, errGenerationStopped
 			}
 			eventName = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 			continue
@@ -542,12 +918,23 @@ func readResponsesStream(w http.ResponseWriter, body io.Reader) (string, error) 
 		}
 	}
 	if err := flush(); err != nil {
-		return full.String(), err
+		return responsesRoundResult{Text: full.String(), Output: result.Output, ToolCalls: result.ToolCalls}, err
 	}
 	if err := scanner.Err(); err != nil {
-		return full.String(), err
+		return responsesRoundResult{Text: full.String(), Output: result.Output, ToolCalls: result.ToolCalls}, err
 	}
-	return full.String(), nil
+	streamed := parseResponseOutputItems(outputItems)
+	if full.Len() == 0 && streamed.Text != "" {
+		sent, err := streamDeltaText(ctx, w, streamed.Text, shouldStop)
+		full.WriteString(sent)
+		if err != nil {
+			return responsesRoundResult{Text: full.String(), Output: streamed.Output, ToolCalls: streamed.ToolCalls}, err
+		}
+	}
+	result.Text = full.String()
+	result.Output = streamed.Output
+	result.ToolCalls = streamed.ToolCalls
+	return result, nil
 }
 
 func parseJSONObject(raw string) (map[string]interface{}, bool, error) {
@@ -562,25 +949,32 @@ func parseJSONObject(raw string) (map[string]interface{}, bool, error) {
 	return value, true, nil
 }
 
-func extractResponseCompletedText(data string) string {
+func parseResponseCompleted(data string) responsesRoundResult {
 	var event struct {
 		Response struct {
-			Output []struct {
-				Type    string `json:"type"`
-				Role    string `json:"role"`
-				Content []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
-			} `json:"output"`
+			Output []responseOutputItem `json:"output"`
 		} `json:"response"`
 	}
 	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return ""
+		return responsesRoundResult{}
 	}
+	return parseResponseOutputItems(event.Response.Output)
+}
+
+func parseResponseOutputItems(items []responseOutputItem) responsesRoundResult {
 	var full strings.Builder
-	for _, item := range event.Response.Output {
-		if item.Type != "message" && item.Role != "assistant" {
+	result := responsesRoundResult{Output: items}
+	for _, item := range items {
+		if item.Type == "function_call" {
+			result.ToolCalls = append(result.ToolCalls, responseToolCall{
+				ID:        item.ID,
+				CallID:    item.CallID,
+				Name:      item.Name,
+				Arguments: item.Arguments,
+			})
+			continue
+		}
+		if item.Type != "message" || item.Role != "assistant" {
 			continue
 		}
 		for _, content := range item.Content {
@@ -589,7 +983,52 @@ func extractResponseCompletedText(data string) string {
 			}
 		}
 	}
-	return full.String()
+	result.Text = full.String()
+	return result
+}
+
+func upsertResponseOutputItem(items *[]responseOutputItem, index map[string]int, item responseOutputItem) {
+	if item.Type == "" {
+		return
+	}
+	key := strings.TrimSpace(item.ID)
+	if key == "" {
+		key = fmt.Sprintf("%s:%d", item.Type, len(*items))
+	}
+	if pos, ok := index[key]; ok {
+		(*items)[pos] = mergeResponseOutputItem((*items)[pos], item)
+		return
+	}
+	index[key] = len(*items)
+	*items = append(*items, item)
+}
+
+func mergeResponseOutputItem(prev, next responseOutputItem) responseOutputItem {
+	if next.Type != "" {
+		prev.Type = next.Type
+	}
+	if next.ID != "" {
+		prev.ID = next.ID
+	}
+	if next.CallID != "" {
+		prev.CallID = next.CallID
+	}
+	if next.Name != "" {
+		prev.Name = next.Name
+	}
+	if next.Arguments != "" {
+		prev.Arguments = next.Arguments
+	}
+	if next.Role != "" {
+		prev.Role = next.Role
+	}
+	if next.Status != "" {
+		prev.Status = next.Status
+	}
+	if len(next.Content) > 0 {
+		prev.Content = next.Content
+	}
+	return prev
 }
 
 func parseResponseError(data string) error {
@@ -610,6 +1049,728 @@ func parseResponseError(data string) error {
 		return fmt.Errorf("%s", strings.TrimSpace(event.Message))
 	}
 	return fmt.Errorf("provider stream error")
+}
+
+func sendToolStep(w http.ResponseWriter, step responseToolStep) {
+	sendSSE(w, "tool_steps", map[string]interface{}{"step": step})
+}
+
+func appendToolStep(steps *[]responseToolStep, step responseToolStep) {
+	if steps == nil {
+		return
+	}
+	*steps = append(*steps, step)
+}
+
+func assistantMetadataWithToolSteps(steps []responseToolStep) string {
+	if len(steps) == 0 {
+		return "{}"
+	}
+	return mustJSONString(map[string]interface{}{"tool_steps": steps})
+}
+
+func (s *Server) executeResponseTool(call responseToolCall, mode string) string {
+	toolMode := normalizeSearchToolMode(mode)
+	switch strings.TrimSpace(call.Name) {
+	case "get_current_time":
+		return executeGetCurrentTimeTool(call.Arguments)
+	case "web_search":
+		if toolMode != searchToolModeUniFuncs {
+			return disabledToolJSON("web_search", "web_search is disabled because Searching mode is active")
+		}
+		return s.executeWebSearchTool(call.Arguments)
+	case "web_reader":
+		if toolMode != searchToolModeUniFuncs {
+			return disabledToolJSON("web_reader", "web_reader is disabled because Searching mode is active")
+		}
+		return s.executeWebReaderTool(call.Arguments)
+	case "searching":
+		if toolMode != searchToolModeSearching {
+			return disabledToolJSON("searching", "searching is disabled because UniFuncs mode is active")
+		}
+		return s.executeSearchingTool(call.Arguments)
+	default:
+		return mustJSONString(map[string]interface{}{
+			"ok":    false,
+			"tool":  call.Name,
+			"error": "不支持的工具",
+		})
+	}
+}
+
+func disabledToolJSON(tool, message string) string {
+	return mustJSONString(map[string]interface{}{
+		"ok":    false,
+		"tool":  tool,
+		"error": message,
+	})
+}
+
+func executeGetCurrentTimeTool(arguments string) string {
+	var args struct {
+		Timezone string `json:"timezone"`
+	}
+	if strings.TrimSpace(arguments) != "" {
+		_ = json.Unmarshal([]byte(arguments), &args)
+	}
+	timezone := strings.TrimSpace(args.Timezone)
+	location := time.Local
+	resolved := location.String()
+	if timezone != "" {
+		loc, err := time.LoadLocation(timezone)
+		if err != nil {
+			return mustJSONString(map[string]interface{}{
+				"ok":       false,
+				"timezone": timezone,
+				"error":    "invalid timezone",
+			})
+		}
+		location = loc
+		resolved = timezone
+	}
+	now := time.Now().In(location)
+	return mustJSONString(map[string]interface{}{
+		"ok":       true,
+		"timezone": resolved,
+		"utc":      now.UTC().Format(time.RFC3339),
+		"local":    now.Format(time.RFC3339),
+		"unix":     now.Unix(),
+	})
+}
+
+func (s *Server) executeWebSearchTool(arguments string) string {
+	var args struct {
+		Query         string `json:"query"`
+		Freshness     string `json:"freshness"`
+		IncludeImages bool   `json:"include_images"`
+		Page          int    `json:"page"`
+		Count         int    `json:"count"`
+	}
+	if strings.TrimSpace(arguments) != "" {
+		_ = json.Unmarshal([]byte(arguments), &args)
+	}
+	query := strings.TrimSpace(args.Query)
+	if query == "" {
+		return mustJSONString(map[string]interface{}{
+			"ok":    false,
+			"tool":  "web_search",
+			"error": "query is required",
+		})
+	}
+	apiKey := strings.TrimSpace(s.getUniFuncsAPIKey())
+	if apiKey == "" {
+		return mustJSONString(map[string]interface{}{
+			"ok":    false,
+			"tool":  "web_search",
+			"query": query,
+			"error": "UNIFUNCS_API_KEY is not configured",
+		})
+	}
+	page := args.Page
+	if page <= 0 {
+		page = 1
+	}
+	count := args.Count
+	if count <= 0 {
+		count = 5
+	}
+	if displayCount := s.webSearchCardResultCount(); displayCount > count {
+		count = displayCount
+	}
+	if count > 10 {
+		count = 10
+	}
+	endpoint, err := s.uniFuncsSearchEndpoint()
+	if err != nil {
+		return webSearchErrorJSON(query, err.Error())
+	}
+	freshness := strings.TrimSpace(args.Freshness)
+	body, err := s.runUniFuncsWebSearch(endpoint, apiKey, query, freshness, args.IncludeImages, page, count)
+	if err != nil {
+		return webSearchErrorJSON(query, err.Error())
+	}
+	if freshness != "" {
+		currentCount := uniFuncsWebSearchResultCount(body)
+		if currentCount >= 0 && currentCount < count {
+			if retryBody, retryErr := s.runUniFuncsWebSearch(endpoint, apiKey, query, "", args.IncludeImages, page, count); retryErr == nil {
+				if retryCount := uniFuncsWebSearchResultCount(retryBody); retryCount > currentCount {
+					body = retryBody
+				}
+			}
+		}
+	}
+	return normalizeWebSearchResponse(query, body)
+}
+
+func (s *Server) runUniFuncsWebSearch(endpoint, apiKey, query, freshness string, includeImages bool, page, count int) ([]byte, error) {
+	requestBody := map[string]interface{}{
+		"query":         query,
+		"includeImages": includeImages,
+		"page":          page,
+		"count":         count,
+	}
+	if freshness != "" {
+		requestBody["freshness"] = freshness
+	}
+	raw, _ := json.Marshal(requestBody)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func webSearchErrorJSON(query, message string) string {
+	return mustJSONString(map[string]interface{}{
+		"ok":    false,
+		"tool":  "web_search",
+		"query": query,
+		"error": strings.TrimSpace(message),
+	})
+}
+
+func (s *Server) executeWebReaderTool(arguments string) string {
+	var args struct {
+		URL           string `json:"url"`
+		Format        string `json:"format"`
+		LiteMode      bool   `json:"lite_mode"`
+		IncludeImages *bool  `json:"include_images"`
+		MaxWords      int    `json:"max_words"`
+		Topic         string `json:"topic"`
+	}
+	if strings.TrimSpace(arguments) != "" {
+		_ = json.Unmarshal([]byte(arguments), &args)
+	}
+	pageURL := strings.TrimSpace(args.URL)
+	if pageURL == "" {
+		return webReaderErrorJSON("", "url is required")
+	}
+	apiKey := strings.TrimSpace(s.getUniFuncsAPIKey())
+	if apiKey == "" {
+		return webReaderErrorJSON(pageURL, "UNIFUNCS_API_KEY is not configured")
+	}
+	format := strings.ToLower(strings.TrimSpace(args.Format))
+	if format == "" {
+		format = "md"
+	}
+	if format != "markdown" && format != "md" && format != "text" && format != "txt" {
+		return webReaderErrorJSON(pageURL, "format must be markdown, md, text, or txt")
+	}
+	maxWords := args.MaxWords
+	if maxWords <= 0 {
+		maxWords = defaultWebReaderMaxWords
+	}
+	if maxWords > maxWebReaderMaxWords {
+		maxWords = maxWebReaderMaxWords
+	}
+	endpoint, err := s.uniFuncsWebReaderEndpoint()
+	if err != nil {
+		return webReaderErrorJSON(pageURL, err.Error())
+	}
+	body, status, requestID, err := s.runUniFuncsWebReader(endpoint, apiKey, pageURL, format, args.LiteMode, args.IncludeImages, maxWords, strings.TrimSpace(args.Topic))
+	if err != nil {
+		return webReaderErrorJSON(pageURL, err.Error())
+	}
+	return normalizeWebReaderResponse(pageURL, format, status, requestID, body)
+}
+
+func (s *Server) runUniFuncsWebReader(endpoint, apiKey, pageURL, format string, liteMode bool, includeImages *bool, maxWords int, topic string) ([]byte, string, string, error) {
+	requestBody := map[string]interface{}{
+		"url":      pageURL,
+		"format":   format,
+		"liteMode": liteMode,
+		"maxWords": maxWords,
+	}
+	if includeImages != nil {
+		requestBody["includeImages"] = *includeImages
+	}
+	if topic != "" {
+		requestBody["topic"] = topic
+	}
+	raw, _ := json.Marshal(requestBody)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return nil, "", "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	status := strings.TrimSpace(resp.Header.Get("X-Unifuncs-Status"))
+	requestID := strings.TrimSpace(firstNonEmpty(resp.Header.Get("X-Unifuncs-Request-Id"), resp.Header.Get("X-Unifuncs-Request-ID"), resp.Header.Get("X-Request-Id"), resp.Header.Get("X-Request-ID")))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, status, requestID, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	if status != "" && status != "0" {
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			message = "UniFuncs returned status " + status
+		}
+		return nil, status, requestID, fmt.Errorf("%s", message)
+	}
+	return body, status, requestID, nil
+}
+
+func webReaderErrorJSON(pageURL, message string) string {
+	return mustJSONString(map[string]interface{}{
+		"ok":    false,
+		"tool":  "web_reader",
+		"url":   pageURL,
+		"error": strings.TrimSpace(message),
+	})
+}
+
+func (s *Server) executeSearchingTool(arguments string) string {
+	var args struct {
+		Query string `json:"query"`
+	}
+	if strings.TrimSpace(arguments) != "" {
+		_ = json.Unmarshal([]byte(arguments), &args)
+	}
+	query := strings.TrimSpace(args.Query)
+	if query == "" {
+		return searchingErrorJSON("", "query is required")
+	}
+	baseURL := strings.TrimSpace(s.settingValue("searching_base_url"))
+	apiKey := strings.TrimSpace(s.settingValue("searching_api_key"))
+	model := strings.TrimSpace(s.settingValue("searching_model"))
+	apiID := strings.TrimSpace(s.settingValue("searching_api_id"))
+	if baseURL == "" || apiKey == "" || model == "" {
+		return searchingErrorJSON(query, "searching_base_url, searching_api_key, and searching_model must be configured")
+	}
+	endpoint, err := openAICompatibleChatCompletionsEndpoint(baseURL)
+	if err != nil {
+		return searchingErrorJSON(query, err.Error())
+	}
+	content, err := s.runSearchingLLM(endpoint, apiKey, model, apiID, query)
+	if err != nil {
+		return searchingErrorJSON(query, err.Error())
+	}
+	return normalizeSearchingResponse(query, model, apiID, content)
+}
+
+func (s *Server) runSearchingLLM(endpoint, apiKey, model, apiID, query string) (string, error) {
+	requestBody := map[string]interface{}{
+		"model":  model,
+		"stream": false,
+		"messages": []map[string]string{
+			{
+				"role":    "system",
+				"content": "You are a web-enabled search model. Search the live web when needed, return useful source-aware findings, and include relevant URLs when available.",
+			},
+			{
+				"role":    "user",
+				"content": query,
+			},
+		},
+	}
+	if apiID != "" {
+		requestBody["id"] = apiID
+		requestBody["api_id"] = apiID
+	}
+	raw, _ := json.Marshal(requestBody)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	content, err := extractSearchingContent(body)
+	if err != nil {
+		return "", err
+	}
+	return content, nil
+}
+
+func openAICompatibleChatCompletionsEndpoint(base string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(base))
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/chat/completions"):
+		parsed.Path = path
+	case strings.HasSuffix(path, "/v1"):
+		parsed.Path = path + "/chat/completions"
+	default:
+		parsed.Path = path + "/v1/chat/completions"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func extractSearchingContent(body []byte) (string, error) {
+	var payload struct {
+		Choices []struct {
+			Message struct {
+				Content interface{} `json:"content"`
+			} `json:"message"`
+			Delta struct {
+				Content interface{} `json:"content"`
+			} `json:"delta"`
+			Text string `json:"text"`
+		} `json:"choices"`
+		Output string `json:"output"`
+		Text   string `json:"text"`
+		Error  struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		content := strings.TrimSpace(string(body))
+		if content == "" {
+			return "", fmt.Errorf("empty searching response")
+		}
+		return content, nil
+	}
+	if strings.TrimSpace(payload.Error.Message) != "" {
+		return "", fmt.Errorf("%s", strings.TrimSpace(payload.Error.Message))
+	}
+	for _, choice := range payload.Choices {
+		if content := contentValueToString(choice.Message.Content); content != "" {
+			return content, nil
+		}
+		if content := contentValueToString(choice.Delta.Content); content != "" {
+			return content, nil
+		}
+		if strings.TrimSpace(choice.Text) != "" {
+			return strings.TrimSpace(choice.Text), nil
+		}
+	}
+	if strings.TrimSpace(payload.Output) != "" {
+		return strings.TrimSpace(payload.Output), nil
+	}
+	if strings.TrimSpace(payload.Text) != "" {
+		return strings.TrimSpace(payload.Text), nil
+	}
+	content := strings.TrimSpace(string(body))
+	if content == "" {
+		return "", fmt.Errorf("empty searching response")
+	}
+	return content, nil
+}
+
+func contentValueToString(value interface{}) string {
+	switch item := value.(type) {
+	case string:
+		return strings.TrimSpace(item)
+	case []interface{}:
+		var parts []string
+		for _, part := range item {
+			obj, ok := part.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if text, ok := obj["text"].(string); ok && strings.TrimSpace(text) != "" {
+				parts = append(parts, strings.TrimSpace(text))
+			}
+			if text, ok := obj["content"].(string); ok && strings.TrimSpace(text) != "" {
+				parts = append(parts, strings.TrimSpace(text))
+			}
+		}
+		return strings.TrimSpace(strings.Join(parts, "\n"))
+	default:
+		return ""
+	}
+}
+
+func normalizeSearchingResponse(query, model, apiID, content string) string {
+	content = strings.TrimSpace(content)
+	truncated := false
+	runes := []rune(content)
+	if len(runes) > maxSearchingOutputRunes {
+		content = string(runes[:maxSearchingOutputRunes])
+		truncated = true
+	}
+	result := map[string]interface{}{
+		"ok":        true,
+		"tool":      "searching",
+		"query":     query,
+		"model":     model,
+		"content":   content,
+		"truncated": truncated,
+	}
+	if apiID != "" {
+		result["api_id"] = apiID
+	}
+	return mustJSONString(result)
+}
+
+func searchingErrorJSON(query, message string) string {
+	return mustJSONString(map[string]interface{}{
+		"ok":    false,
+		"tool":  "searching",
+		"query": query,
+		"error": strings.TrimSpace(message),
+	})
+}
+
+func (s *Server) getUniFuncsAPIKey() string {
+	if value := strings.TrimSpace(s.settingValue("unifuncs_api_key")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(s.cfg.UniFuncsAPIKey)
+}
+
+func (s *Server) getUniFuncsBaseURL() string {
+	if value := strings.TrimSpace(s.settingValue("unifuncs_base_url")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(s.cfg.UniFuncsBaseURL)
+}
+
+func (s *Server) uniFuncsSearchEndpoint() (string, error) {
+	base := strings.TrimSpace(s.getUniFuncsBaseURL())
+	if base == "" {
+		base = "https://api.unifuncs.com"
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/api/web-search/search"):
+		parsed.Path = strings.TrimRight(path, "/")
+	case strings.HasSuffix(path, "/api"):
+		parsed.Path = strings.TrimSuffix(path, "/api") + "/api/web-search/search"
+	default:
+		parsed.Path = path + "/api/web-search/search"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func (s *Server) uniFuncsWebReaderEndpoint() (string, error) {
+	base := strings.TrimSpace(s.getUniFuncsBaseURL())
+	if base == "" {
+		base = "https://api.unifuncs.com"
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	switch {
+	case strings.HasSuffix(path, "/api/web-reader/read"):
+		parsed.Path = strings.TrimRight(path, "/")
+	case strings.HasSuffix(path, "/api/web-reader"):
+		parsed.Path = path + "/read"
+	case strings.HasSuffix(path, "/api/web-search/search"):
+		parsed.Path = strings.TrimSuffix(path, "/api/web-search/search") + "/api/web-reader/read"
+	case strings.HasSuffix(path, "/api"):
+		parsed.Path = strings.TrimSuffix(path, "/api") + "/api/web-reader/read"
+	default:
+		parsed.Path = path + "/api/web-reader/read"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func (s *Server) settingValue(key string) string {
+	if s == nil || s.store == nil || s.store.DB == nil {
+		return ""
+	}
+	var value string
+	err := s.store.DB.QueryRow(`SELECT value FROM app_settings WHERE key = ?`, key).Scan(&value)
+	if err != nil {
+		return ""
+	}
+	return value
+}
+
+func normalizeWebSearchResponse(query string, body []byte) string {
+	var payload struct {
+		Code      json.Number `json:"code"`
+		Message   string      `json:"message"`
+		RequestID string      `json:"requestId"`
+		ReqID     string      `json:"request_id"`
+		Data      struct {
+			WebPages []struct {
+				Name       string `json:"name"`
+				URL        string `json:"url"`
+				DisplayURL string `json:"displayUrl"`
+				Snippet    string `json:"snippet"`
+				Summary    string `json:"summary"`
+				SiteName   string `json:"siteName"`
+				SiteIcon   string `json:"siteIcon"`
+				Date       string `json:"datePublished"`
+			} `json:"webPages"`
+			Images []struct {
+				Name         string `json:"name"`
+				ContentURL   string `json:"contentUrl"`
+				ThumbnailURL string `json:"thumbnailUrl"`
+				HostPageURL  string `json:"hostPageUrl"`
+			} `json:"images"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return webSearchErrorJSON(query, "invalid UniFuncs response: "+err.Error())
+	}
+	code := 0
+	if payload.Code != "" {
+		if parsed, err := payload.Code.Int64(); err == nil {
+			code = int(parsed)
+		}
+	}
+	requestID := firstNonEmpty(payload.RequestID, payload.ReqID)
+	if code != 0 {
+		message := strings.TrimSpace(payload.Message)
+		if message == "" {
+			message = "UniFuncs returned an error"
+		}
+		return mustJSONString(map[string]interface{}{
+			"ok":         false,
+			"tool":       "web_search",
+			"query":      query,
+			"code":       code,
+			"message":    message,
+			"request_id": requestID,
+		})
+	}
+	results := make([]map[string]interface{}, 0, len(payload.Data.WebPages))
+	for _, item := range payload.Data.WebPages {
+		result := map[string]interface{}{
+			"title":   strings.TrimSpace(item.Name),
+			"url":     strings.TrimSpace(item.URL),
+			"snippet": strings.TrimSpace(firstNonEmpty(item.Summary, item.Snippet)),
+		}
+		if displayURL := strings.TrimSpace(item.DisplayURL); displayURL != "" {
+			result["display_url"] = displayURL
+		}
+		if siteName := strings.TrimSpace(item.SiteName); siteName != "" {
+			result["site_name"] = siteName
+		}
+		if siteIcon := strings.TrimSpace(item.SiteIcon); siteIcon != "" {
+			result["site_icon"] = siteIcon
+		}
+		if date := strings.TrimSpace(item.Date); date != "" {
+			result["date"] = date
+		}
+		results = append(results, result)
+	}
+	images := make([]map[string]interface{}, 0, len(payload.Data.Images))
+	for _, item := range payload.Data.Images {
+		images = append(images, map[string]interface{}{
+			"title":         strings.TrimSpace(item.Name),
+			"content_url":   strings.TrimSpace(item.ContentURL),
+			"thumbnail_url": strings.TrimSpace(item.ThumbnailURL),
+			"source_url":    strings.TrimSpace(item.HostPageURL),
+		})
+	}
+	return mustJSONString(map[string]interface{}{
+		"ok":         true,
+		"tool":       "web_search",
+		"query":      query,
+		"request_id": requestID,
+		"results":    results,
+		"images":     images,
+	})
+}
+
+func normalizeWebReaderResponse(pageURL, format, status, requestID string, body []byte) string {
+	content := strings.TrimSpace(string(body))
+	truncated := false
+	runes := []rune(content)
+	if len(runes) > maxWebReaderOutputRunes {
+		content = string(runes[:maxWebReaderOutputRunes])
+		truncated = true
+	}
+	title := webReaderTitle(content)
+	result := map[string]interface{}{
+		"ok":        true,
+		"tool":      "web_reader",
+		"url":       pageURL,
+		"format":    format,
+		"content":   content,
+		"truncated": truncated,
+	}
+	if title != "" {
+		result["title"] = title
+	}
+	if status != "" {
+		result["status"] = status
+	}
+	if requestID != "" {
+		result["request_id"] = requestID
+	}
+	return mustJSONString(result)
+}
+
+func webReaderTitle(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
+		}
+	}
+	return ""
+}
+
+func uniFuncsWebSearchResultCount(body []byte) int {
+	var payload struct {
+		Code json.Number `json:"code"`
+		Data struct {
+			WebPages []struct{} `json:"webPages"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return -1
+	}
+	if payload.Code != "" {
+		if parsed, err := payload.Code.Int64(); err == nil && parsed != 0 {
+			return -1
+		}
+	}
+	return len(payload.Data.WebPages)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func mustJSONString(value interface{}) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return `{"ok":false,"error":"tool serialization failed"}`
+	}
+	return string(raw)
 }
 
 var _ = sql.ErrNoRows

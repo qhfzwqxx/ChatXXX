@@ -6,6 +6,7 @@ ChatXXX is a standalone rewrite of the original `chat` subproject.
 - Frontend: React + Vite + TypeScript
 - Database: SQLite
 - Runtime boundary: fully independent from the existing PHP main site
+- Built-in Responses tools: current time, UniFuncs web search/web reader mode, and Searching LLM mode
 
 The project borrows the product logic and interface patterns from the existing chat module, but does not reuse its PHP runtime, session system, or old database.
 

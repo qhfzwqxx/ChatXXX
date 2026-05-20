@@ -307,6 +307,13 @@ func (s *Server) updateMessageContent(id int64, content, status string) {
 	_, _ = s.store.DB.Exec(`UPDATE messages SET content=?, status=?, updated_at=? WHERE id=?`, content, status, db.Now(), id)
 }
 
+func (s *Server) updateMessageContentWithMetadata(id int64, content, status, metadata string) {
+	if strings.TrimSpace(metadata) == "" {
+		metadata = "{}"
+	}
+	_, _ = s.store.DB.Exec(`UPDATE messages SET content=?, status=?, metadata=?, updated_at=? WHERE id=?`, content, status, metadata, db.Now(), id)
+}
+
 func (s *Server) updateUserMessageContent(id, userID int64, content, metadata string) error {
 	return s.updateUserMessageContentWithAttachments(id, userID, content, metadata, "")
 }

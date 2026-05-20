@@ -34,6 +34,22 @@ export const api = {
   providers: () => request<{ providers: Provider[] }>('/api/admin/providers'),
   createProvider: (payload: Partial<Provider>) =>
     request<{ provider: Provider }>('/api/admin/providers', { method: 'POST', body: JSON.stringify(payload) }),
+  updateProvider: (id: number, payload: Partial<Provider>) =>
+    request<{ provider: Provider }>(`/api/admin/providers/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteProvider: (id: number) => request<{ ok: boolean }>(`/api/admin/providers/${id}`, { method: 'DELETE' }),
+  adminSettings: () => request<{ settings: Record<string, { key: string; value: string }> }>('/api/admin/settings'),
+  updateAdminSettings: (payload: {
+    search_tool_mode: string;
+    unifuncs_api_key: string;
+    unifuncs_base_url: string;
+    web_search_card_result_count: string;
+    searching_base_url: string;
+    searching_api_key: string;
+    searching_model: string;
+    searching_api_id: string;
+  }) =>
+    request<{ ok: boolean }>('/api/admin/settings', { method: 'PATCH', body: JSON.stringify(payload) }),
+  clientSettings: () => request<{ settings: { web_search_card_result_count: number } }>('/api/settings'),
   providerCapabilities: () =>
     request<{ capabilities: { providers: Provider[]; default_provider_id: number } }>('/api/provider-capabilities'),
   conversations: (archived = false) =>
@@ -44,6 +60,8 @@ export const api = {
   updateConversation: (id: number, payload: Partial<Conversation>) =>
     request<{ conversation: Conversation }>(`/api/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteConversation: (id: number) => request<{ ok: boolean }>(`/api/conversations/${id}`, { method: 'DELETE' }),
+  stopGeneration: (payload: { run_id?: string; assistant_message_id?: number; content?: string }) =>
+    request<{ ok: boolean }>('/api/chat/stop', { method: 'POST', body: JSON.stringify(payload) }),
   memories: () => request<{ memories: Memory[]; total: number; enabled_count: number }>('/api/memories'),
   createMemory: (content: string) => request<{ memory: Memory }>('/api/memories', { method: 'POST', body: JSON.stringify({ content }) })
 };

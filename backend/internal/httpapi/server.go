@@ -64,6 +64,7 @@ func (s *Server) Routes() http.Handler {
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireUser)
+		r.Get("/api/settings", s.handleGetClientSettings)
 		r.Get("/api/provider-capabilities", s.handleProviderCapabilities)
 		r.Get("/api/conversations", s.handleListConversations)
 		r.Post("/api/conversations", s.handleCreateConversation)
@@ -88,6 +89,8 @@ func (s *Server) Routes() http.Handler {
 		r.Post("/api/admin/providers", s.handleAdminCreateProvider)
 		r.Patch("/api/admin/providers/{id}", s.handleAdminUpdateProvider)
 		r.Delete("/api/admin/providers/{id}", s.handleAdminDeleteProvider)
+		r.Get("/api/admin/settings", s.handleAdminGetSettings)
+		r.Patch("/api/admin/settings", s.handleAdminUpdateSettings)
 		r.Get("/api/admin/usage", s.handleAdminUsage)
 	})
 
