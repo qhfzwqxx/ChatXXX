@@ -516,6 +516,82 @@ func TestExecuteImageGenerateToolUsesDocumentedJSONFormat(t *testing.T) {
 	}
 }
 
+func TestExecuteImageGenerateToolRetriesTransientProviderError(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			fmt.Fprint(w, `{"error":{"message":"Upstream request failed","type":"upstream_error"}}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"created": 123,
+			"data": []map[string]string{
+				{"url": "https://example.com/retried-image.png"},
+			},
+		})
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t)
+	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
+	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_base_url":   upstream.URL,
+		"image_tool_api_key":    "image-key",
+		"image_generate_model":  "gpt-image-2",
+		"image_default_size":    "1024x1024",
+		"image_default_quality": "auto",
+		"image_response_format": "url",
+	})
+	raw := server.executeImageGenerateTool(`{"prompt":"画一只猫"}`)
+	var got imageToolResult
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal image output: %v", err)
+	}
+	if !got.OK || len(got.Images) != 1 || got.Images[0].URL != "https://example.com/retried-image.png" {
+		t.Fatalf("unexpected output: %s", raw)
+	}
+	if calls != 2 {
+		t.Fatalf("expected one retry, got %d calls", calls)
+	}
+}
+
+func TestExecuteImageGenerateToolShowsFriendlyTransientProviderError(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, `{"error":{"message":"Upstream request failed","type":"upstream_error"}}`)
+	}))
+	defer upstream.Close()
+
+	store := newTestStore(t)
+	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
+	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_base_url":   upstream.URL,
+		"image_tool_api_key":    "image-key",
+		"image_generate_model":  "gpt-image-2",
+		"image_default_size":    "1024x1024",
+		"image_default_quality": "auto",
+		"image_response_format": "url",
+	})
+	raw := server.executeImageGenerateTool(`{"prompt":"画一只猫"}`)
+	var got imageToolResult
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal image output: %v", err)
+	}
+	if got.OK || got.Error != "图片服务上游暂时失败，请稍后重试" {
+		t.Fatalf("unexpected output: %s", raw)
+	}
+	if strings.Contains(got.Error, "Bad Gateway") || strings.Contains(got.Error, "upstream_error") {
+		t.Fatalf("raw provider error leaked to user output: %s", raw)
+	}
+	if calls != 2 {
+		t.Fatalf("expected one retry, got %d calls", calls)
+	}
+}
+
 func TestExecuteImageGenerateToolUsesResponsesMode(t *testing.T) {
 	var gotAuth, gotContentType string
 	var gotBody map[string]interface{}

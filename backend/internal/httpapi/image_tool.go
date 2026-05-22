@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
@@ -27,6 +28,7 @@ const maxImageReferenceBytes = 8 * 1024 * 1024
 const maxImageResponseBytes = 64 * 1024 * 1024
 
 const imageToolHTTPTimeout = 300 * time.Second
+const imageToolRetryDelay = 250 * time.Millisecond
 
 var (
 	dataImagePattern     = regexp.MustCompile(`data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=_-]+`)
@@ -53,6 +55,35 @@ type imageToolResult struct {
 	Created int64                  `json:"created,omitempty"`
 	Images  []imageToolResultImage `json:"images,omitempty"`
 	Error   string                 `json:"error,omitempty"`
+}
+
+type imageProviderHTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e imageProviderHTTPError) Error() string {
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		return fmt.Sprintf("provider returned %s", e.Status)
+	}
+	return fmt.Sprintf("provider returned %s: %s", e.Status, body)
+}
+
+type imageTransportError struct {
+	Err error
+}
+
+func (e imageTransportError) Error() string {
+	if e.Err == nil {
+		return "image provider request failed"
+	}
+	return e.Err.Error()
+}
+
+func (e imageTransportError) Unwrap() error {
+	return e.Err
 }
 
 func imageToolDefinitions() []map[string]interface{} {
@@ -497,21 +528,37 @@ func (s *Server) runChatCompletionsImageGeneration(apiKey string, request imageG
 func (s *Server) runImageJSON(path, apiKey string, payload map[string]interface{}) ([]byte, error) {
 	raw, _ := json.Marshal(payload)
 	endpoint := strings.TrimRight(s.imageToolBaseURL(), "/") + path
+	client := &http.Client{Timeout: imageToolHTTPTimeout}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		body, err := doImageJSONRequest(client, endpoint, apiKey, raw)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !shouldRetryImageToolError(err) || attempt == 1 {
+			break
+		}
+		time.Sleep(imageToolRetryDelay)
+	}
+	return nil, lastErr
+}
+
+func doImageJSONRequest(client *http.Client, endpoint, apiKey string, raw []byte) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{Timeout: imageToolHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, imageTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxImageResponseBytes))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, imageProviderHTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(body)}
 	}
 	return body, nil
 }
@@ -519,22 +566,38 @@ func (s *Server) runImageJSON(path, apiKey string, payload map[string]interface{
 func (s *Server) runImageStreamingJSON(path, apiKey string, payload map[string]interface{}, mode string) ([]byte, error) {
 	raw, _ := json.Marshal(payload)
 	endpoint := strings.TrimRight(s.imageToolBaseURL(), "/") + path
+	client := &http.Client{Timeout: imageToolHTTPTimeout}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		body, err := doImageStreamingJSONRequest(client, endpoint, apiKey, raw, mode)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+		if !shouldRetryImageToolError(err) || attempt == 1 {
+			break
+		}
+		time.Sleep(imageToolRetryDelay)
+	}
+	return nil, lastErr
+}
+
+func doImageStreamingJSONRequest(client *http.Client, endpoint, apiKey string, raw []byte, mode string) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{Timeout: imageToolHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, imageTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	limited := io.LimitReader(resp.Body, maxImageResponseBytes)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(limited)
-		return nil, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, imageProviderHTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(body)}
 	}
 	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 		return readImageStreamingJSON(mode, limited)
@@ -730,21 +793,38 @@ func (s *Server) runImageMultipart(path, apiKey string, fields map[string]string
 		return nil, err
 	}
 	endpoint := strings.TrimRight(s.imageToolBaseURL(), "/") + path
-	req, err := http.NewRequest(http.MethodPost, endpoint, &body)
+	client := &http.Client{Timeout: imageToolHTTPTimeout}
+	raw := body.Bytes()
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		respBody, err := doImageMultipartRequest(client, endpoint, apiKey, writer.FormDataContentType(), raw)
+		if err == nil {
+			return respBody, nil
+		}
+		lastErr = err
+		if !shouldRetryImageToolError(err) || attempt == 1 {
+			break
+		}
+		time.Sleep(imageToolRetryDelay)
+	}
+	return nil, lastErr
+}
+
+func doImageMultipartRequest(client *http.Client, endpoint, apiKey, contentType string, raw []byte) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	client := &http.Client{Timeout: imageToolHTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, imageTransportError{Err: err}
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxImageResponseBytes))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(respBody)))
+		return nil, imageProviderHTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(respBody)}
 	}
 	return respBody, nil
 }
@@ -1165,7 +1245,42 @@ func (s *Server) saveGeneratedImageToWorkspace(userID int64, tool string, index 
 }
 
 func imageToolErrorJSON(tool, message string) string {
-	return mustJSONString(imageToolResult{OK: false, Tool: tool, Error: strings.TrimSpace(message)})
+	return mustJSONString(imageToolResult{OK: false, Tool: tool, Error: friendlyImageToolError(message)})
+}
+
+func shouldRetryImageToolError(err error) bool {
+	var providerErr imageProviderHTTPError
+	if errors.As(err, &providerErr) {
+		return providerErr.StatusCode == http.StatusBadGateway ||
+			providerErr.StatusCode == http.StatusServiceUnavailable ||
+			providerErr.StatusCode == http.StatusGatewayTimeout
+	}
+	var transportErr imageTransportError
+	return errors.As(err, &transportErr)
+}
+
+func friendlyImageToolError(message string) string {
+	text := strings.TrimSpace(message)
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "upstream request failed"),
+		strings.Contains(lower, "upstream_error"),
+		strings.Contains(lower, "502 bad gateway"),
+		strings.Contains(lower, "503 service unavailable"),
+		strings.Contains(lower, "504 gateway timeout"):
+		return "图片服务上游暂时失败，请稍后重试"
+	case strings.Contains(lower, "context deadline exceeded"),
+		strings.Contains(lower, "client.timeout"),
+		strings.Contains(lower, "timeout"):
+		return "图片生成超时，请稍后重试"
+	case strings.Contains(lower, "401 unauthorized"),
+		strings.Contains(lower, "403 forbidden"):
+		return "图片服务鉴权失败，请检查后台图片 API Key"
+	case text == "":
+		return "图片生成失败，请稍后重试"
+	default:
+		return text
+	}
 }
 
 func (s *Server) normalizeImageGenerateInput(value interface{}, userID int64, publicBaseURL string) (interface{}, bool, error) {
