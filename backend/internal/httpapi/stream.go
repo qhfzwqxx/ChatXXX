@@ -234,8 +234,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			fullText = text
 			stopped = true
 		} else if err != nil {
-			fullText = "模型调用失败：" + userFacingModelStreamError(err)
-			sendSSE(w, "error", map[string]interface{}{"code": "LLM_REQUEST_FAILED", "message": fullText})
+			if hasSuccessfulImageToolStep(toolSteps) {
+				fullText = successfulImageToolFallbackText(text)
+			} else {
+				fullText = "模型调用失败：" + userFacingModelStreamError(err)
+				sendSSE(w, "error", map[string]interface{}{"code": "LLM_REQUEST_FAILED", "message": fullText})
+			}
 		} else {
 			fullText = text
 		}
@@ -767,6 +771,8 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, pro
 				}
 				input = append(input, responseStreamReconnectRetryMessage())
 				continue
+			} else if toolSteps != nil && hasSuccessfulImageToolStep(*toolSteps) {
+				return successfulImageToolFallbackText(full.String()), nil
 			} else {
 				return full.String(), err
 			}
@@ -1543,6 +1549,14 @@ func hasSuccessfulImageToolStep(steps []responseToolStep) bool {
 	return false
 }
 
+func successfulImageToolFallbackText(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed != "" {
+		return trimmed
+	}
+	return "图片已生成。"
+}
+
 func assistantMetadataWithToolSteps(steps []responseToolStep) string {
 	return assistantMetadataWithToolStepsAndMemoryHits(steps, memoryHitPayload{})
 }
@@ -1553,12 +1567,112 @@ func assistantMetadataWithToolStepsAndMemoryHits(steps []responseToolStep, hits 
 	}
 	metadata := map[string]interface{}{}
 	if len(steps) > 0 {
-		metadata["tool_steps"] = steps
+		metadata["tool_steps"] = sanitizeToolStepsForMetadata(steps)
 	}
 	if len(hits.Memories) > 0 {
 		metadata["memory_hits"] = hits
 	}
 	return mustJSONString(metadata)
+}
+
+func sanitizeToolStepsForMetadata(steps []responseToolStep) []responseToolStep {
+	if len(steps) == 0 {
+		return steps
+	}
+	next := make([]responseToolStep, len(steps))
+	for i, step := range steps {
+		next[i] = step
+		if (step.Name == "image_generate" || step.Name == "image_edit") && step.Output != "" {
+			if output, changed := sanitizeImageToolOutputString(step.Output); changed {
+				next[i].Output = output
+			}
+		}
+	}
+	return next
+}
+
+func sanitizeMessageMetadataForClient(raw string) string {
+	if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "{}" {
+		return raw
+	}
+	var metadata map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return raw
+	}
+	steps, ok := metadata["tool_steps"].([]interface{})
+	if !ok {
+		return raw
+	}
+	changed := false
+	for _, stepValue := range steps {
+		step, ok := stepValue.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _ := step["name"].(string)
+		if name != "image_generate" && name != "image_edit" {
+			continue
+		}
+		output, _ := step["output"].(string)
+		if sanitized, ok := sanitizeImageToolOutputString(output); ok {
+			step["output"] = sanitized
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	return mustJSONString(metadata)
+}
+
+func metadataHasSuccessfulImageToolStep(raw string) bool {
+	if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "{}" {
+		return false
+	}
+	var metadata struct {
+		ToolSteps []responseToolStep `json:"tool_steps"`
+	}
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return false
+	}
+	return hasSuccessfulImageToolStep(metadata.ToolSteps)
+}
+
+func sanitizeImageToolOutputString(raw string) (string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return raw, false
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return raw, false
+	}
+	images, ok := payload["images"].([]interface{})
+	if !ok {
+		return raw, false
+	}
+	changed := false
+	for _, imageValue := range images {
+		image, ok := imageValue.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if !hasStringField(image, "b64_json") {
+			continue
+		}
+		if hasStringField(image, "url") || hasStringField(image, "workspace_path") {
+			delete(image, "b64_json")
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	return mustJSONString(payload), true
+}
+
+func hasStringField(item map[string]interface{}, key string) bool {
+	value, ok := item[key].(string)
+	return ok && strings.TrimSpace(value) != ""
 }
 
 func (s *Server) executeResponseTool(call responseToolCall, mode string) string {

@@ -1155,6 +1155,9 @@ func (s *Server) persistInlineImageResults(tool string, images []imageToolResult
 				}
 			}
 		}
+		if strings.TrimSpace(item.WorkspacePath) != "" {
+			item.B64JSON = ""
+		}
 		next = append(next, item)
 	}
 	return next

@@ -174,7 +174,7 @@ type ImageToolOutput = {
   ok?: boolean;
   tool?: string;
   created?: number;
-  images?: Array<{ url?: string; b64_json?: string }>;
+  images?: Array<{ url?: string; b64_json?: string; workspace_path?: string }>;
   error?: string;
 };
 
@@ -2071,8 +2071,9 @@ function isStepOlderThan(step: ToolStep, thresholdMs: number, now = Date.now()) 
   return now - startedAt >= thresholdMs;
 }
 
-function imageToolSource(item: { url?: string; b64_json?: string }) {
+function imageToolSource(item: { url?: string; b64_json?: string; workspace_path?: string }) {
   if (item.url) return item.url;
+  if (item.workspace_path) return `/api/workspace/files/${item.workspace_path}`;
   if (item.b64_json) return item.b64_json.startsWith('data:') ? item.b64_json : `data:image/png;base64,${item.b64_json}`;
   return '';
 }
@@ -2223,10 +2224,11 @@ function parseImageToolOutput(value?: string): ImageToolOutput | null {
       const image = entry as Record<string, unknown>;
       const url = typeof image.url === 'string' ? image.url : '';
       const b64 = typeof image.b64_json === 'string' ? image.b64_json : '';
-      if (!url && !b64) return null;
-      return { url, b64_json: b64 };
+      const workspacePath = typeof image.workspace_path === 'string' ? image.workspace_path : '';
+      if (!url && !b64 && !workspacePath) return null;
+      return { url, b64_json: b64, workspace_path: workspacePath };
     })
-    .filter((entry): entry is { url: string; b64_json: string } => !!entry);
+    .filter((entry): entry is { url: string; b64_json: string; workspace_path: string } => !!entry);
   return {
     ok: typeof item.ok === 'boolean' ? item.ok : undefined,
     tool: typeof item.tool === 'string' ? item.tool : undefined,

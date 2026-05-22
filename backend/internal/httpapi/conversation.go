@@ -300,6 +300,10 @@ func (s *Server) listMessages(conversationID, userID int64) ([]Message, error) {
 		err := rows.Scan(&m.ID, &m.ConversationID, &m.UserID, &m.Role, &m.Content, &m.ReasoningContent, &m.Status, &m.Attachments, &m.Metadata, &m.VersionGroupID, &m.VersionIndex, &active, &m.ParentUserMessageID, &m.SortOrder, &m.CreatedAt, &m.UpdatedAt)
 		if err == nil {
 			m.IsActiveVersion = active == 1
+			m.Metadata = sanitizeMessageMetadataForClient(m.Metadata)
+			if strings.HasPrefix(strings.TrimSpace(m.Content), "模型调用失败：") && metadataHasSuccessfulImageToolStep(m.Metadata) {
+				m.Content = "图片已生成。"
+			}
 			items = append(items, m)
 		}
 	}

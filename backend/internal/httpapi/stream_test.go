@@ -1154,6 +1154,84 @@ func TestChatCompletionsImageModeCanReuseGeneratedBase64Image(t *testing.T) {
 	assertChatImageRequestUsesSignedWorkspaceURLForTest(t, imageRequests[1], path)
 }
 
+func TestStreamResponsesKeepsSuccessfulImageWhenAssistantSummaryFails(t *testing.T) {
+	store := newTestStore(t)
+	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir(), PublicBaseURL: "https://chat.example.com"}}
+	seedUserAndConversationForImageFlowTest(t, store)
+
+	var imageRequest map[string]interface{}
+	image := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("unexpected image responses path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&imageRequest); err != nil {
+			t.Fatalf("decode image responses body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "event: response.completed\n")
+		fmt.Fprint(w, "data: "+mustJSONStringForTest(map[string]interface{}{
+			"response": map[string]interface{}{
+				"output": []map[string]interface{}{
+					{"type": "image_generation_call", "status": "completed", "result": base64.StdEncoding.EncodeToString(testPNGData(t, 8))},
+				},
+			},
+		})+"\n\n")
+	}))
+	defer image.Close()
+
+	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":       imageToolModeResponses,
+		"image_tool_base_url":   image.URL,
+		"image_tool_api_key":    "image-key",
+		"image_responses_model": "gpt-5.5",
+	})
+
+	var calls int
+	llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("unexpected main LLM responses path: %s", r.URL.Path)
+		}
+		calls++
+		if calls == 1 {
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "event: response.completed\n")
+			fmt.Fprint(w, "data: "+mustJSONStringForTest(map[string]interface{}{
+				"response": map[string]interface{}{
+					"output": []map[string]interface{}{
+						{
+							"type":      "function_call",
+							"id":        "fc_1",
+							"call_id":   "call_1",
+							"name":      "image_generate",
+							"arguments": `{"prompt":"画一只猫"}`,
+							"status":    "completed",
+						},
+					},
+				},
+			})+"\n\n")
+			return
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"error":{"message":"Upstream request failed","type":"upstream_error"}}`)
+	}))
+	defer llm.Close()
+
+	var toolSteps []responseToolStep
+	text, err := server.streamResponses(context.Background(), httptest.NewRecorder(), runtimeProvider{Base: llm.URL, Key: "llm-key", Model: "main-model", RequestMode: "responses"}, nil, 1, 1, "画一只猫", "", "", "https://chat.example.com", &toolSteps, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("streamResponses: %v", err)
+	}
+	if text != "图片已生成。" {
+		t.Fatalf("expected preserved success text, got %q", text)
+	}
+	if !hasSuccessfulImageToolStep(toolSteps) {
+		t.Fatalf("expected successful image tool step, got %#v", toolSteps)
+	}
+	if imageRequest == nil {
+		t.Fatalf("expected image request to run")
+	}
+}
+
 func TestExecuteImageGenerateToolResolvesWorkspaceReference(t *testing.T) {
 	var gotBody map[string]interface{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1278,7 +1356,7 @@ func TestExecuteImageEditToolUsesDocumentedMultipartFormat(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatalf("unmarshal image edit output: %v", err)
 	}
-	if !got.OK || got.Tool != "image_edit" || len(got.Images) != 1 || got.Images[0].B64JSON == "" {
+	if !got.OK || got.Tool != "image_edit" || len(got.Images) != 1 || got.Images[0].B64JSON != "" || got.Images[0].WorkspacePath == "" || got.Images[0].URL == "" {
 		t.Fatalf("unexpected output: %s", raw)
 	}
 	if gotAuth != "Bearer image-key" || !strings.HasPrefix(gotContentType, "multipart/form-data; boundary=") {
@@ -1378,6 +1456,70 @@ func TestMessagePromptContentIncludesGeneratedImageURLs(t *testing.T) {
 	}
 	if strings.Contains(content, "ZmFrZQ==") || strings.Contains(content, "data:image") {
 		t.Fatalf("generated image prompt should not include base64: %s", content)
+	}
+}
+
+func TestSanitizeMessageMetadataForClientOmitsImageBase64WhenURLExists(t *testing.T) {
+	output := mustJSONString(imageToolResult{
+		OK:   true,
+		Tool: "image_generate",
+		Images: []imageToolResultImage{
+			{URL: "/api/workspace/files/users/1/generated/cat.png", B64JSON: "ZmFrZQ==", WorkspacePath: "users/1/generated/cat.png"},
+		},
+	})
+	metadata := mustJSONString(map[string]interface{}{
+		"tool_steps": []map[string]interface{}{
+			{
+				"name":   "image_generate",
+				"status": "completed",
+				"output": output,
+			},
+		},
+	})
+	sanitized := sanitizeMessageMetadataForClient(metadata)
+	if strings.Contains(sanitized, "ZmFrZQ==") || strings.Contains(sanitized, "b64_json") {
+		t.Fatalf("sanitized metadata should omit image base64: %s", sanitized)
+	}
+	if !strings.Contains(sanitized, "/api/workspace/files/users/1/generated/cat.png") || !strings.Contains(sanitized, "users/1/generated/cat.png") {
+		t.Fatalf("sanitized metadata should keep image references: %s", sanitized)
+	}
+}
+
+func TestConversationResponseRewritesFailedSummaryForSuccessfulImageStep(t *testing.T) {
+	store := newTestStore(t)
+	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
+	seedUserAndConversationForImageFlowTest(t, store)
+	metadata := mustJSONString(map[string]interface{}{
+		"tool_steps": []map[string]interface{}{
+			{
+				"name":   "image_generate",
+				"status": "completed",
+				"output": mustJSONString(imageToolResult{
+					OK:   true,
+					Tool: "image_generate",
+					Images: []imageToolResultImage{
+						{URL: "/api/workspace/files/users/1/generated/cat.png", WorkspacePath: "users/1/generated/cat.png"},
+					},
+				}),
+			},
+		},
+	})
+	if _, err := store.DB.Exec(`INSERT INTO messages (conversation_id, user_id, role, content, status, attachments, metadata, version_group_id, version_index, is_active_version, sort_order, created_at, updated_at) VALUES (1, 1, 'assistant', '模型调用失败：模型服务暂时不可用，请稍后重试', 'completed', '[]', ?, 1, 1, 1, 20, ?, ?)`, metadata, db.Now(), db.Now()); err != nil {
+		t.Fatalf("insert assistant: %v", err)
+	}
+	conversation, err := server.getConversationForUser(1, 1)
+	if err != nil {
+		t.Fatalf("get conversation: %v", err)
+	}
+	messages, err := server.listMessages(conversation.ID, 1)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) == 0 || messages[len(messages)-1].Content != "图片已生成。" {
+		t.Fatalf("expected successful image fallback text, got %#v", messages)
+	}
+	if strings.Contains(messages[len(messages)-1].Metadata, "b64_json") {
+		t.Fatalf("expected sanitized metadata, got %s", messages[len(messages)-1].Metadata)
 	}
 }
 
