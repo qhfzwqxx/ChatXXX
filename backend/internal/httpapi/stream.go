@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,6 +22,7 @@ import (
 const (
 	streamDeltaChunkRunes  = 4
 	streamDeltaDelay       = 55 * time.Millisecond
+	streamKeepAliveEvery   = 15 * time.Second
 	maxResponsesToolRounds = 8
 
 	defaultWebReaderMaxWords = 12000
@@ -29,11 +31,21 @@ const (
 	maxSearchingOutputRunes  = 60000
 )
 
-const responsesBaseToolInstruction = "You have local tools available in this chat runtime. Do not say you lack tools when the user asks for current web information or asks you to use an available tool; call the appropriate tool instead."
+const runtimeSystemToolPrinciple = "Tool use principle: use available tools whenever they materially help the user's request; call tools serially, one at a time; choose a reasonable order so each tool result informs the next step."
 
-const responsesUniFuncsToolInstruction = responsesBaseToolInstruction + "\n\nCurrent web tool mode: UniFuncs. Available web tools are web_search and web_reader. The searching tool is not available in this mode.\n\nFor web_search, infer the user's real intent before calling the tool. If the wording is misspelled, transliterated, abbreviated, or mixed-language, resolve it to the most likely real-world person, place, event, product, or topic in your own reasoning, then search that intended target. Do not mechanically copy the user's raw text into the query. Ask for clarification only when multiple interpretations are equally plausible or the target cannot be inferred with reasonable confidence.\n\nFor web_reader, call it when there is a concrete URL to read, including URLs returned by web_search. Prefer format=markdown unless plain text is specifically better.\n\nFor web/current/research questions, prefer the combined workflow whenever useful: first call web_search to discover candidate pages, then call web_reader on the most relevant 1 to 3 result URLs before giving the final answer. Use this search-then-read workflow especially for news, recent facts, product/company/person details, documentation lookups, and any answer that benefits from page-level evidence."
+const responsesToolPacingInstruction = "Tool pacing rule: if you need more than one tool in the same assistant reply, do not call tools back-to-back from the user's perspective. After any tool result, write a brief user-visible sentence before calling another tool."
 
-const responsesSearchingToolInstruction = responsesBaseToolInstruction + "\n\nCurrent web tool mode: Searching. The only available web search tool is searching. web_search and web_reader are not available in this mode.\n\nFor web/current/research questions, call searching with a concise query and use the returned content as the browsing/search evidence before giving the final answer."
+const responsesToolPacingRetryInstruction = "Tool pacing rule: you just received a tool result, so you must write a brief user-visible sentence before calling another tool. Do not call a tool again until you have emitted that visible assistant text."
+
+const responsesStreamReconnectRetryInstruction = "The previous streamed assistant response was interrupted before a tool call was completed. Continue from the already-visible assistant text without repeating it. If the user's request requires an available tool, call that tool now."
+
+const responsesBaseToolInstruction = "You have local tools available in this chat runtime. Do not say you lack tools when the user asks for current web information or asks you to use an available tool; call the appropriate tool instead.\n\n" + runtimeSystemToolPrinciple + "\n\n" + responsesToolPacingInstruction
+
+const responsesWorkspaceToolInstruction = "\n\nWorkspace files: user uploads are stored in a per-user workspace. User messages may list workspace file names, paths, MIME type, size, and dimensions. Image tool routing rules:\n1. Use image_generate for text-to-image and image-to-image/reference generation. This includes: 图生图, 以这张图为参考生成, 以这张图为基础生成, 参考这张图重新画, 按这张图的构图/主体/姿势生成, 换风格生成, 风格化, generate from this image, use this image as reference, style transfer. Put the workspace path or generated image URL in the image argument.\n2. Use image_edit only when the user explicitly provides or asks to use a mask/mask image/mask_index/mask_path. If no mask is provided or requested, do not call image_edit; use image_generate instead, even when the user says edit/change/modify an image.\n3. If the user gives an uploaded image or a previously generated image URL but asks for a new image based on it, choose image_generate, not image_edit. image_edit is not the general uploaded-image tool.\nDo not ask the user to paste base64 image data.\n\nGenerated-image display rule: image_generate and image_edit results are already displayed to the user in dedicated image tool cards by the chat UI. After these tools return images, do not repeat the generated images in the assistant text with Markdown image syntax, HTML img tags, raw base64, or duplicate image URLs. You may still write ordinary text around the result if it is useful."
+
+const responsesUniFuncsToolInstruction = responsesBaseToolInstruction + responsesWorkspaceToolInstruction + "\n\nCurrent web tool mode: UniFuncs. Available web tools are web_search and web_reader. The searching tool is not available in this mode.\n\nFor web_search, infer the user's real intent before calling the tool. If the wording is misspelled, transliterated, abbreviated, or mixed-language, resolve it to the most likely real-world person, place, event, product, or topic in your own reasoning, then search that intended target. Do not mechanically copy the user's raw text into the query. Ask for clarification only when multiple interpretations are equally plausible or the target cannot be inferred with reasonable confidence.\n\nFor web_reader, call it when there is a concrete URL to read, including URLs returned by web_search. Prefer format=markdown unless plain text is specifically better.\n\nFor web/current/research questions, prefer the combined workflow whenever useful: first call web_search to discover candidate pages, then call web_reader on the most relevant 1 to 3 result URLs before giving the final answer. Use this search-then-read workflow especially for news, recent facts, product/company/person details, documentation lookups, and any answer that benefits from page-level evidence."
+
+const responsesSearchingToolInstruction = responsesBaseToolInstruction + responsesWorkspaceToolInstruction + "\n\nCurrent web tool mode: Searching. The only available web search tool is searching. web_search and web_reader are not available in this mode.\n\nFor web/current/research questions, call searching with a concise query and use the returned content as the browsing/search evidence before giving the final answer."
 
 var errGenerationStopped = errors.New("generation stopped")
 
@@ -48,11 +60,19 @@ type streamRequest struct {
 }
 
 type attachment struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Size    int64  `json:"size"`
-	Content string `json:"content,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Name          string `json:"name"`
+	Type          string `json:"type"`
+	Size          int64  `json:"size"`
+	Content       string `json:"content,omitempty"`
+	Error         string `json:"error,omitempty"`
+	Width         int    `json:"width,omitempty"`
+	Height        int    `json:"height,omitempty"`
+	OriginalName  string `json:"original_name,omitempty"`
+	OriginalType  string `json:"original_type,omitempty"`
+	OriginalSize  int64  `json:"original_size,omitempty"`
+	Preview       string `json:"preview,omitempty"`
+	WorkspacePath string `json:"workspace_path,omitempty"`
+	URL           string `json:"url,omitempty"`
 }
 
 type responseInputContent struct {
@@ -109,6 +129,8 @@ type responseToolStep struct {
 	ContentOffset int    `json:"content_offset"`
 }
 
+type streamPersistFunc func(text string, force bool)
+
 type responsesRoundResult struct {
 	Text      string
 	Output    []responseOutputItem
@@ -144,10 +166,19 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	startSSE(w)
+	w = &lockedResponseWriter{ResponseWriter: w}
+	stopKeepAlive := startSSEKeepAlive(r.Context(), w)
+	defer stopKeepAlive()
 	runID := uuid.NewString()
 	content := strings.TrimSpace(req.Content)
 	mode := strings.TrimSpace(req.Mode)
-	attachmentsJSON := attachmentsMetadata(req.Attachments)
+	preparedAttachments, err := s.prepareWorkspaceAttachments(user.ID, req.Attachments)
+	if err != nil {
+		sendSSE(w, "error", map[string]interface{}{"code": "ATTACHMENT_SAVE_FAILED", "message": err.Error()})
+		sendSSE(w, "done", map[string]interface{}{"ok": false})
+		return
+	}
+	attachmentsJSON := attachmentsMetadata(preparedAttachments)
 	if content == "" && len(req.Attachments) == 0 && mode != "regenerate" {
 		sendSSE(w, "error", map[string]interface{}{"code": "EMPTY_MESSAGE", "message": "消息不能为空"})
 		sendSSE(w, "done", map[string]interface{}{"ok": false})
@@ -160,6 +191,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		sendSSE(w, "done", map[string]interface{}{"ok": false})
 		return
 	}
+	promptContent := strings.TrimSpace(userMessage.Content)
 	assistant, err := s.insertMessage(req.ConversationID, user.ID, "assistant", "", "streaming", "{}")
 	if err != nil {
 		sendSSE(w, "error", map[string]interface{}{"code": "SERVER_ERROR", "message": "创建回复失败"})
@@ -170,27 +202,37 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	_, _ = s.store.DB.Exec(`INSERT INTO generation_runs (run_id, conversation_id, assistant_message_id, user_id, status, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, 'running', '{}', ?, ?)`, runID, req.ConversationID, assistant.ID, user.ID, now, now)
 
 	sendSSE(w, "message_start", map[string]interface{}{"run_id": runID, "user_message": userMessage, "assistant_message": assistant})
+	if promptContent != "" {
+		firstUserMessage := s.firstUserMessageContent(req.ConversationID, user.ID, promptContent)
+		go s.maybeGenerateConversationTitle(context.Background(), req.ConversationID, user.ID, firstUserMessage)
+	}
 
 	provider, _ := s.getRuntimeProvider(req.ProviderID)
-	promptContent := strings.TrimSpace(userMessage.Content)
 	var fullText string
 	toolSteps := make([]responseToolStep, 0)
+	var memoryHits memoryHitPayload
+	persistPartial := s.partialMessagePersister(assistant.ID, user.ID)
 	stopped := false
 	if provider == nil || provider.Key == "" || provider.Base == "" || provider.Model == "" {
 		fullText = "这是 ChatXXX 的本地流式占位回复。你还没有配置可用的 OpenAI-compatible provider；请使用管理员账号到设置里添加模型。"
-		text, err := streamLocalText(generationCtx, w, fullText, func() bool { return s.isGenerationStopping(runID, user.ID) })
+		text, err := streamLocalText(generationCtx, w, fullText, persistPartial, func() bool { return s.isGenerationStopping(runID, user.ID) })
 		fullText = text
 		stopped = errors.Is(err, errGenerationStopped)
 	} else {
 		conversation, _ := s.getConversationForUser(req.ConversationID, user.ID)
-		text, err := s.streamOpenAICompatible(generationCtx, w, *provider, conversation, req.ConversationID, user.ID, promptContent, &toolSteps, func() bool {
+		persistToolMetadata := func(steps []responseToolStep) {
+			metadata := assistantMetadataWithToolStepsAndMemoryHits(steps, memoryHits)
+			s.updateMessageMetadata(assistant.ID, metadata)
+		}
+		publicBaseURL := s.publicBaseURLForRequest(r)
+		text, err := s.streamOpenAICompatible(generationCtx, w, *provider, conversation, req.ConversationID, user.ID, promptContent, publicBaseURL, &toolSteps, &memoryHits, persistPartial, persistToolMetadata, func() bool {
 			return s.isGenerationStopping(runID, user.ID)
 		})
 		if errors.Is(err, errGenerationStopped) {
 			fullText = text
 			stopped = true
 		} else if err != nil {
-			fullText = "模型调用失败：" + err.Error()
+			fullText = "模型调用失败：" + userFacingModelStreamError(err)
 			sendSSE(w, "error", map[string]interface{}{"code": "LLM_REQUEST_FAILED", "message": fullText})
 		} else {
 			fullText = text
@@ -207,25 +249,27 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(fullText) == "" && stopped {
 		fullText = "已停止生成"
+	} else if strings.TrimSpace(fullText) == "" && hasSuccessfulImageToolStep(toolSteps) {
+		fullText = ""
 	} else if strings.TrimSpace(fullText) == "" {
 		fullText = "没有收到模型输出。"
 	}
-	assistantMetadata := assistantMetadataWithToolSteps(toolSteps)
+	persistPartial(fullText, true)
+	assistantMetadata := assistantMetadataWithToolStepsAndMemoryHits(toolSteps, memoryHits)
 	finalStatus := "completed"
 	if stopped {
 		finalStatus = "stopped"
 	}
 	s.updateMessageContentWithMetadata(assistant.ID, fullText, finalStatus, assistantMetadata)
 	_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status=?, updated_at=? WHERE run_id=?`, finalStatus, db.Now(), runID)
-	if promptContent != "" {
-		_, _ = s.store.DB.Exec(`UPDATE conversations SET title = CASE WHEN title='新对话' THEN ? ELSE title END, updated_at=? WHERE id=? AND user_id=?`, titleFromContent(promptContent), db.Now(), req.ConversationID, user.ID)
-		sendSSE(w, "conversation_title", map[string]interface{}{"conversation_id": req.ConversationID, "title": titleFromContent(promptContent)})
-	}
 	assistant.Content = fullText
 	assistant.Status = finalStatus
 	assistant.Metadata = assistantMetadata
 	sendSSE(w, "message_end", map[string]interface{}{"message": assistant})
 	sendSSE(w, "done", map[string]interface{}{"ok": !stopped, "status": finalStatus})
+	if !stopped && finalStatus == "completed" && strings.TrimSpace(promptContent) != "" && strings.TrimSpace(fullText) != "" && !strings.HasPrefix(fullText, "模型调用失败：") {
+		s.runAutoMemoryAfterReply(req.ConversationID, user.ID, userMessage, assistant)
+	}
 }
 
 func (s *Server) prepareUserMessageForStream(conversationID, userID int64, content, mode string, messageID int64, metadata, attachments string) (Message, error) {
@@ -284,6 +328,11 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		if req.AssistantMessageID <= 0 {
 			_ = s.store.DB.QueryRow(`SELECT assistant_message_id FROM generation_runs WHERE run_id=? AND user_id=?`, req.RunID, user.ID).Scan(&req.AssistantMessageID)
 		}
+	} else if req.AssistantMessageID > 0 {
+		_ = s.store.DB.QueryRow(`SELECT run_id FROM generation_runs WHERE assistant_message_id=? AND user_id=? AND status IN ('running','stopping') ORDER BY created_at DESC LIMIT 1`, req.AssistantMessageID, user.ID).Scan(&req.RunID)
+		if strings.TrimSpace(req.RunID) != "" {
+			_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status='stopping', updated_at=? WHERE run_id=? AND user_id=?`, db.Now(), req.RunID, user.ID)
+		}
 	}
 	if req.AssistantMessageID > 0 {
 		content := req.Content
@@ -321,6 +370,42 @@ func startSSE(w http.ResponseWriter) {
 	w.Header().Set("X-Accel-Buffering", "no")
 }
 
+type lockedResponseWriter struct {
+	http.ResponseWriter
+	mu sync.Mutex
+}
+
+func (w *lockedResponseWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *lockedResponseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func startSSEKeepAlive(ctx context.Context, w http.ResponseWriter) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		ticker := time.NewTicker(streamKeepAliveEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sendSSE(w, "ping", map[string]interface{}{"time": time.Now().UTC().Format(time.RFC3339)})
+			}
+		}
+	}()
+	return cancel
+}
+
 func sendSSE(w http.ResponseWriter, event string, data interface{}) {
 	payload, _ := json.Marshal(data)
 	_, _ = fmt.Fprintf(w, "event: %s\n", event)
@@ -330,11 +415,11 @@ func sendSSE(w http.ResponseWriter, event string, data interface{}) {
 	}
 }
 
-func streamLocalText(ctx context.Context, w http.ResponseWriter, text string, shouldStop func() bool) (string, error) {
-	return streamDeltaText(ctx, w, text, shouldStop)
+func streamLocalText(ctx context.Context, w http.ResponseWriter, text string, persist streamPersistFunc, shouldStop func() bool) (string, error) {
+	return streamDeltaText(ctx, w, text, persist, shouldStop)
 }
 
-func streamDeltaText(ctx context.Context, w http.ResponseWriter, text string, shouldStop func() bool) (string, error) {
+func streamDeltaText(ctx context.Context, w http.ResponseWriter, text string, persist streamPersistFunc, shouldStop func() bool) (string, error) {
 	var full strings.Builder
 	runes := []rune(text)
 	for i := 0; i < len(runes); i += streamDeltaChunkRunes {
@@ -348,9 +433,44 @@ func streamDeltaText(ctx context.Context, w http.ResponseWriter, text string, sh
 		chunk := string(runes[i:end])
 		full.WriteString(chunk)
 		sendSSE(w, "delta", map[string]interface{}{"text": chunk})
+		if persist != nil {
+			persist(full.String(), false)
+		}
 		time.Sleep(streamDeltaDelay)
 	}
+	if persist != nil {
+		persist(full.String(), true)
+	}
 	return full.String(), nil
+}
+
+func (s *Server) partialMessagePersister(messageID, userID int64) streamPersistFunc {
+	var lastText string
+	var lastWrite time.Time
+	return func(text string, force bool) {
+		if messageID <= 0 || userID <= 0 {
+			return
+		}
+		if text == lastText && !force {
+			return
+		}
+		now := time.Now()
+		if !force && now.Sub(lastWrite) < 400*time.Millisecond && len([]rune(text))-len([]rune(lastText)) < 12 {
+			return
+		}
+		_, _ = s.store.DB.Exec(`UPDATE messages SET content=?, status='streaming', updated_at=? WHERE id=? AND user_id=? AND role='assistant' AND status='streaming'`, text, db.Now(), messageID, userID)
+		lastText = text
+		lastWrite = now
+	}
+}
+
+func prefixedPersist(prefix string, persist streamPersistFunc) streamPersistFunc {
+	if persist == nil {
+		return nil
+	}
+	return func(text string, force bool) {
+		persist(prefix+text, force)
+	}
 }
 
 func streamShouldStop(ctx context.Context, shouldStop func() bool) bool {
@@ -389,18 +509,96 @@ func attachmentsMetadata(items []attachment) string {
 func messagePromptContent(msg Message) string {
 	content := strings.TrimSpace(msg.Content)
 	attachmentText := attachmentPromptText(msg.Attachments)
+	generatedImageText := generatedImagePromptText(msg.Metadata)
 	if attachmentText == "" {
-		return content
+		if generatedImageText == "" {
+			return content
+		}
+		if content == "" {
+			return generatedImageText
+		}
+		return content + "\n\n" + generatedImageText
 	}
 	if content == "" {
-		return attachmentText
+		if generatedImageText == "" {
+			return attachmentText
+		}
+		return attachmentText + "\n\n" + generatedImageText
 	}
-	return content + "\n\n" + attachmentText
+	if generatedImageText == "" {
+		return content + "\n\n" + attachmentText
+	}
+	return content + "\n\n" + attachmentText + "\n\n" + generatedImageText
+}
+
+func generatedImagePromptText(raw string) string {
+	if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "{}" {
+		return ""
+	}
+	var metadata struct {
+		ToolSteps []responseToolStep `json:"tool_steps"`
+	}
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return ""
+	}
+	type generatedImageRef struct {
+		Tool          string
+		URL           string
+		WorkspacePath string
+	}
+	refs := make([]generatedImageRef, 0)
+	seen := map[string]bool{}
+	for _, step := range metadata.ToolSteps {
+		if step.Status != "completed" || (step.Name != "image_generate" && step.Name != "image_edit") {
+			continue
+		}
+		var output imageToolResult
+		if err := json.Unmarshal([]byte(step.Output), &output); err != nil || !output.OK {
+			continue
+		}
+		for _, image := range output.Images {
+			urlValue := strings.TrimSpace(image.URL)
+			pathValue := strings.TrimSpace(image.WorkspacePath)
+			key := firstNonEmpty(pathValue, urlValue)
+			if key == "" || seen[key] {
+				continue
+			}
+			seen[key] = true
+			refs = append(refs, generatedImageRef{Tool: step.Name, URL: urlValue, WorkspacePath: pathValue})
+		}
+	}
+	if len(refs) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("此前由图片工具生成的图片 URL，可作为后续 image_generate 的 image 参数使用：")
+	for index, ref := range refs {
+		if index >= 8 {
+			break
+		}
+		b.WriteString("\n- ")
+		b.WriteString(ref.Tool)
+		b.WriteString("：")
+		if ref.WorkspacePath != "" {
+			b.WriteString("workspace_path=")
+			b.WriteString(ref.WorkspacePath)
+			if ref.URL != "" {
+				b.WriteString("；url=")
+				b.WriteString(ref.URL)
+			}
+			continue
+		}
+		b.WriteString(ref.URL)
+	}
+	return b.String()
 }
 
 func attachmentPromptText(raw string) string {
 	if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "[]" {
 		return ""
+	}
+	if summary := attachmentWorkspaceSummary(raw); summary != "" {
+		return summary
 	}
 	var items []attachment
 	if err := json.Unmarshal([]byte(raw), &items); err != nil {
@@ -452,26 +650,51 @@ func (s *Server) getRuntimeProvider(id int64) (*runtimeProvider, error) {
 	return &p, nil
 }
 
-func (s *Server) streamOpenAICompatible(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string, toolSteps *[]responseToolStep, shouldStop func() bool) (string, error) {
+func (s *Server) streamOpenAICompatible(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest, publicBaseURL string, toolSteps *[]responseToolStep, memoryHits *memoryHitPayload, persist streamPersistFunc, persistToolMetadata func([]responseToolStep), shouldStop func() bool) (string, error) {
+	memoryInstruction := ""
+	if conversation == nil || conversation.MemoryEnabled {
+		retrieval := s.memoriesForInjection(ctx, userID, latest, s.memoryInjectLimit())
+		memoryInstruction = memorySystemPrompt(retrieval.Memories)
+		if (retrieval.Method == "vector" || retrieval.Method == "vector_rerank") && len(retrieval.Memories) > 0 {
+			payload := memoryHitPayload{
+				Method:   retrieval.Method,
+				Model:    retrieval.Model,
+				Dim:      retrieval.Dim,
+				Memories: retrieval.Hits,
+			}
+			if memoryHits != nil {
+				*memoryHits = payload
+			}
+			sendSSE(w, "memory_hits", payload)
+		}
+	}
+	workspaceInstruction := s.workspaceSystemPrompt(userID)
 	switch strings.TrimSpace(provider.RequestMode) {
 	case "", "chat_completions":
-		return s.streamChatCompletions(ctx, w, provider, conversation, conversationID, userID, latest, shouldStop)
+		return s.streamChatCompletions(ctx, w, provider, conversation, conversationID, userID, latest, memoryInstruction, workspaceInstruction, persist, shouldStop)
 	case "responses":
-		return s.streamResponses(ctx, w, provider, conversation, conversationID, userID, latest, toolSteps, shouldStop)
+		return s.streamResponses(ctx, w, provider, conversation, conversationID, userID, latest, memoryInstruction, workspaceInstruction, publicBaseURL, toolSteps, persist, persistToolMetadata, shouldStop)
 	default:
 		return "", fmt.Errorf("不支持的请求模式：%s", provider.RequestMode)
 	}
 }
 
-func (s *Server) streamChatCompletions(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string, shouldStop func() bool) (string, error) {
+func (s *Server) streamChatCompletions(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest, memoryInstruction, workspaceInstruction string, persist streamPersistFunc, shouldStop func() bool) (string, error) {
 	messages, _ := s.listMessages(conversationID, userID)
 	type chatMessage struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	}
 	bodyMessages := make([]chatMessage, 0, len(messages)+1)
+	bodyMessages = append(bodyMessages, chatMessage{Role: "system", Content: runtimeSystemToolPrinciple})
 	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
 		bodyMessages = append(bodyMessages, chatMessage{Role: "system", Content: strings.TrimSpace(conversation.SystemPrompt)})
+	}
+	if strings.TrimSpace(memoryInstruction) != "" {
+		bodyMessages = append(bodyMessages, chatMessage{Role: "system", Content: strings.TrimSpace(memoryInstruction)})
+	}
+	if strings.TrimSpace(workspaceInstruction) != "" {
+		bodyMessages = append(bodyMessages, chatMessage{Role: "system", Content: strings.TrimSpace(workspaceInstruction)})
 	}
 	for _, msg := range messages {
 		if msg.Role == "user" || msg.Role == "assistant" || msg.Role == "system" {
@@ -509,70 +732,274 @@ func (s *Server) streamChatCompletions(ctx context.Context, w http.ResponseWrite
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
-	return readChatCompletionsStream(ctx, w, resp.Body, shouldStop)
+	return readChatCompletionsStream(ctx, w, resp.Body, persist, shouldStop)
 }
 
-func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest string, toolSteps *[]responseToolStep, shouldStop func() bool) (string, error) {
+func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest, memoryInstruction, workspaceInstruction, publicBaseURL string, toolSteps *[]responseToolStep, persist streamPersistFunc, persistToolMetadata func([]responseToolStep), shouldStop func() bool) (string, error) {
 	messages, _ := s.listMessages(conversationID, userID)
 	input := buildResponsesInput(messages, latest)
 	mode := s.searchToolMode()
 	tools := responseToolDefinitions(mode)
+	toolCtx := responseToolContext{Context: ctx, ConversationID: conversationID, UserID: userID, PublicBaseURL: publicBaseURL}
 	var full strings.Builder
+	needTextBeforeTool := false
+	retriedStreamDisconnect := false
 	for round := 0; round < maxResponsesToolRounds; round++ {
-		result, err := s.readResponsesRound(ctx, w, provider, conversation, input, tools, mode, shouldStop)
+		persistRound := prefixedPersist(full.String(), persist)
+		result, err := s.readResponsesRound(ctx, w, provider, conversation, memoryInstruction, workspaceInstruction, input, tools, mode, persistRound, shouldStop)
+		textAlreadyAppended := false
 		if err != nil {
-			return full.String(), err
+			hasToolCall := len(result.ToolCalls) > 0
+			hasVisibleText := strings.TrimSpace(result.Text) != ""
+			if result.Text != "" {
+				full.WriteString(result.Text)
+				textAlreadyAppended = true
+			}
+			if hasToolCall {
+				// Some providers close the SSE body before response.completed even though the
+				// function_call item has arrived. Treat the completed tool call as usable.
+			} else if shouldRetryResponsesStreamDisconnect(err, retriedStreamDisconnect, result, shouldStop) {
+				retriedStreamDisconnect = true
+				if hasVisibleText {
+					input = append(input, responseAssistantTextMessage(result.Text))
+				}
+				input = append(input, responseStreamReconnectRetryMessage())
+				continue
+			} else {
+				return full.String(), err
+			}
 		}
-		if result.Text != "" {
+		hasVisibleText := strings.TrimSpace(result.Text) != ""
+		if result.Text != "" && !textAlreadyAppended {
 			full.WriteString(result.Text)
+		}
+		if hasVisibleText {
+			needTextBeforeTool = false
 		}
 		if streamShouldStop(ctx, shouldStop) {
 			return full.String(), errGenerationStopped
 		}
-		for _, item := range result.Output {
-			input = append(input, item)
-		}
 		if len(result.ToolCalls) == 0 {
 			return full.String(), nil
 		}
-		for _, call := range result.ToolCalls {
-			if streamShouldStop(ctx, shouldStop) {
-				return full.String(), errGenerationStopped
-			}
-			offset := len([]rune(full.String()))
-			running := responseToolStep{
-				Name:          call.Name,
-				CallID:        call.CallID,
-				Status:        "running",
-				Arguments:     call.Arguments,
-				Timestamp:     db.Now(),
-				ContentOffset: offset,
-			}
-			sendToolStep(w, running)
-			appendToolStep(toolSteps, running)
-			output := s.executeResponseTool(call, mode)
-			if streamShouldStop(ctx, shouldStop) {
-				return full.String(), errGenerationStopped
-			}
-			completed := responseToolStep{
-				Name:          call.Name,
-				CallID:        call.CallID,
-				Status:        "completed",
-				Arguments:     call.Arguments,
-				Output:        output,
-				Timestamp:     db.Now(),
-				ContentOffset: offset,
-			}
-			sendToolStep(w, completed)
-			appendToolStep(toolSteps, completed)
-			input = append(input, responseFunctionCallOutput{
-				Type:   "function_call_output",
-				CallID: call.CallID,
-				Output: output,
-			})
+		if needTextBeforeTool && !hasVisibleText {
+			input = append(input, responseToolPacingMessage())
+			continue
 		}
+		call := result.ToolCalls[0]
+		for _, item := range responseOutputItemsForToolCall(result.Output, call) {
+			input = append(input, item)
+		}
+		if streamShouldStop(ctx, shouldStop) {
+			return full.String(), errGenerationStopped
+		}
+		offset := len([]rune(full.String()))
+		running := responseToolStep{
+			Name:          call.Name,
+			CallID:        call.CallID,
+			Status:        "running",
+			Arguments:     call.Arguments,
+			Timestamp:     db.Now(),
+			ContentOffset: offset,
+		}
+		sendToolStep(w, running)
+		appendToolStep(toolSteps, running)
+		persistToolMetadataSnapshot(toolSteps, persistToolMetadata)
+		output := s.executeResponseToolWithContext(call, mode, toolCtx)
+		if streamShouldStop(ctx, shouldStop) {
+			return full.String(), errGenerationStopped
+		}
+		completed := responseToolStep{
+			Name:          call.Name,
+			CallID:        call.CallID,
+			Status:        "completed",
+			Arguments:     call.Arguments,
+			Output:        output,
+			Timestamp:     db.Now(),
+			ContentOffset: offset,
+		}
+		sendToolStep(w, completed)
+		appendToolStep(toolSteps, completed)
+		persistToolMetadataSnapshot(toolSteps, persistToolMetadata)
+		modelOutput := toolOutputForModel(call.Name, output)
+		input = append(input, responseFunctionCallOutput{
+			Type:   "function_call_output",
+			CallID: call.CallID,
+			Output: modelOutput,
+		})
+		needTextBeforeTool = true
 	}
 	return full.String(), fmt.Errorf("工具调用次数过多")
+}
+
+func toolOutputForModel(toolName, output string) string {
+	if toolName != "image_generate" && toolName != "image_edit" {
+		return output
+	}
+	var payload imageToolResult
+	if err := json.Unmarshal([]byte(output), &payload); err != nil || !payload.OK {
+		return output
+	}
+	type modelImage struct {
+		URL           string `json:"url,omitempty"`
+		WorkspacePath string `json:"workspace_path,omitempty"`
+		Omitted       bool   `json:"omitted,omitempty"`
+		Kind          string `json:"kind,omitempty"`
+	}
+	type modelOutput struct {
+		OK         bool         `json:"ok"`
+		Tool       string       `json:"tool"`
+		Created    int64        `json:"created,omitempty"`
+		ImageCount int          `json:"image_count"`
+		Images     []modelImage `json:"images,omitempty"`
+		Note       string       `json:"note,omitempty"`
+		Error      string       `json:"error,omitempty"`
+	}
+	result := modelOutput{
+		OK:         payload.OK,
+		Tool:       payload.Tool,
+		Created:    payload.Created,
+		ImageCount: len(payload.Images),
+		Error:      payload.Error,
+	}
+	omitted := 0
+	for _, image := range payload.Images {
+		urlValue := strings.TrimSpace(image.URL)
+		pathValue := strings.TrimSpace(image.WorkspacePath)
+		if pathValue != "" {
+			result.Images = append(result.Images, modelImage{WorkspacePath: pathValue})
+			if strings.TrimSpace(image.B64JSON) != "" {
+				omitted++
+			}
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(urlValue), "data:image/") {
+			omitted++
+			result.Images = append(result.Images, modelImage{Kind: "inline_image", Omitted: true})
+			continue
+		}
+		if urlValue != "" {
+			result.Images = append(result.Images, modelImage{URL: urlValue})
+			continue
+		}
+		if strings.TrimSpace(image.B64JSON) != "" {
+			omitted++
+			result.Images = append(result.Images, modelImage{Kind: "inline_image", Omitted: true})
+		}
+	}
+	if omitted > 0 {
+		result.Note = "Generated image data was omitted from this model-facing tool result; the user can already see it in the image tool card."
+	}
+	return mustJSONString(result)
+}
+
+func responseToolPacingMessage() responseInputMessage {
+	return responseInputMessage{
+		Type: "message",
+		Role: "system",
+		Content: []responseInputContent{
+			{Type: "input_text", Text: responsesToolPacingRetryInstruction},
+		},
+	}
+}
+
+func responseStreamReconnectRetryMessage() responseInputMessage {
+	return responseInputMessage{
+		Type: "message",
+		Role: "system",
+		Content: []responseInputContent{
+			{Type: "input_text", Text: responsesStreamReconnectRetryInstruction},
+		},
+	}
+}
+
+func responseAssistantTextMessage(text string) responseInputMessage {
+	return responseInputMessage{
+		Type:   "message",
+		Role:   "assistant",
+		Status: "completed",
+		Content: []responseOutputContent{
+			{Type: "output_text", Text: text, Annotations: []interface{}{}, Logprobs: []interface{}{}},
+		},
+	}
+}
+
+func shouldRetryResponsesStreamDisconnect(err error, alreadyRetried bool, result responsesRoundResult, shouldStop func() bool) bool {
+	if alreadyRetried || !isRetryableProviderStreamDisconnect(err) || len(result.ToolCalls) > 0 {
+		return false
+	}
+	if streamShouldStop(context.Background(), shouldStop) {
+		return false
+	}
+	return true
+}
+
+func isRetryableProviderStreamDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unexpected eof") || strings.Contains(message, "connection reset") || strings.Contains(message, "stream error")
+}
+
+func userFacingModelStreamError(err error) string {
+	if err == nil {
+		return "模型连接中断，请稍后重试"
+	}
+	if isRetryableProviderStreamDisconnect(err) {
+		return "模型连接中断，请稍后重试"
+	}
+	message := strings.TrimSpace(err.Error())
+	if message == "" {
+		return "模型连接中断，请稍后重试"
+	}
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded") {
+		return "模型响应超时，请稍后重试"
+	}
+	if strings.Contains(lower, "service temporarily unavailable") || strings.Contains(lower, "503") {
+		return "模型服务暂时不可用，请稍后重试"
+	}
+	return message
+}
+
+func responseOutputItemsForToolCall(items []responseOutputItem, call responseToolCall) []responseOutputItem {
+	selected := make([]responseOutputItem, 0, len(items))
+	includedCall := false
+	for _, item := range items {
+		if item.Type != "function_call" {
+			selected = append(selected, item)
+			continue
+		}
+		if !includedCall && responseOutputItemMatchesCall(item, call) {
+			selected = append(selected, item)
+			includedCall = true
+		}
+	}
+	if !includedCall {
+		selected = append(selected, responseOutputItem{
+			Type:      "function_call",
+			ID:        call.ID,
+			CallID:    call.CallID,
+			Name:      call.Name,
+			Arguments: call.Arguments,
+			Status:    "completed",
+		})
+	}
+	return selected
+}
+
+func responseOutputItemMatchesCall(item responseOutputItem, call responseToolCall) bool {
+	if call.ID != "" && item.ID == call.ID {
+		return true
+	}
+	if call.CallID != "" && item.CallID == call.CallID {
+		return true
+	}
+	return item.Name == call.Name && item.Arguments == call.Arguments
 }
 
 func responseMessageForInput(msg Message, content string) responseInputMessage {
@@ -639,6 +1066,7 @@ func responseToolDefinitions(mode string) []map[string]interface{} {
 			},
 		},
 	}
+	tools = append(tools, imageToolDefinitions()...)
 	if normalizeSearchToolMode(mode) == searchToolModeSearching {
 		return append(tools, map[string]interface{}{
 			"type":        "function",
@@ -737,7 +1165,7 @@ func responseToolInstructions(mode string) string {
 	return responsesUniFuncsToolInstruction
 }
 
-func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, input []interface{}, tools []map[string]interface{}, mode string, shouldStop func() bool) (responsesRoundResult, error) {
+func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, memoryInstruction, workspaceInstruction string, input []interface{}, tools []map[string]interface{}, mode string, persist streamPersistFunc, shouldStop func() bool) (responsesRoundResult, error) {
 	requestBody := map[string]interface{}{
 		"model":       provider.Model,
 		"input":       input,
@@ -748,6 +1176,12 @@ func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, 
 	instructions := responseToolInstructions(mode)
 	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
 		instructions = instructions + "\n\n" + strings.TrimSpace(conversation.SystemPrompt)
+	}
+	if strings.TrimSpace(memoryInstruction) != "" {
+		instructions = instructions + "\n\n" + strings.TrimSpace(memoryInstruction)
+	}
+	if strings.TrimSpace(workspaceInstruction) != "" {
+		instructions = instructions + "\n\n" + strings.TrimSpace(workspaceInstruction)
 	}
 	if strings.TrimSpace(instructions) != "" {
 		requestBody["instructions"] = instructions
@@ -773,10 +1207,10 @@ func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return responsesRoundResult{}, fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
-	return readResponsesStream(ctx, w, resp.Body, shouldStop)
+	return readResponsesStream(ctx, w, resp.Body, persist, shouldStop)
 }
 
-func readChatCompletionsStream(ctx context.Context, w http.ResponseWriter, body io.Reader, shouldStop func() bool) (string, error) {
+func readChatCompletionsStream(ctx context.Context, w http.ResponseWriter, body io.Reader, persist streamPersistFunc, shouldStop func() bool) (string, error) {
 	var full strings.Builder
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024), 1024*1024)
@@ -808,7 +1242,8 @@ func readChatCompletionsStream(ctx context.Context, w http.ResponseWriter, body 
 				sendSSE(w, "thinking", map[string]interface{}{"text": choice.Delta.ReasoningContent})
 			}
 			if choice.Delta.Content != "" {
-				sent, err := streamDeltaText(ctx, w, choice.Delta.Content, shouldStop)
+				persistChunk := prefixedPersist(full.String(), persist)
+				sent, err := streamDeltaText(ctx, w, choice.Delta.Content, persistChunk, shouldStop)
 				full.WriteString(sent)
 				if err != nil {
 					return full.String(), err
@@ -819,10 +1254,13 @@ func readChatCompletionsStream(ctx context.Context, w http.ResponseWriter, body 
 	if err := scanner.Err(); err != nil {
 		return full.String(), err
 	}
+	if persist != nil {
+		persist(full.String(), true)
+	}
 	return full.String(), nil
 }
 
-func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Reader, shouldStop func() bool) (responsesRoundResult, error) {
+func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Reader, persist streamPersistFunc, shouldStop func() bool) (responsesRoundResult, error) {
 	var full strings.Builder
 	result := responsesRoundResult{}
 	outputItems := make([]responseOutputItem, 0)
@@ -856,7 +1294,8 @@ func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Rea
 				return nil
 			}
 			if event.Delta != "" {
-				sent, err := streamDeltaText(ctx, w, event.Delta, shouldStop)
+				persistChunk := prefixedPersist(full.String(), persist)
+				sent, err := streamDeltaText(ctx, w, event.Delta, persistChunk, shouldStop)
 				full.WriteString(sent)
 				if err != nil {
 					return err
@@ -875,7 +1314,7 @@ func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Rea
 		case "response.completed":
 			completed := parseResponseCompleted(data)
 			if full.Len() == 0 && completed.Text != "" {
-				sent, err := streamDeltaText(ctx, w, completed.Text, shouldStop)
+				sent, err := streamDeltaText(ctx, w, completed.Text, persist, shouldStop)
 				full.WriteString(sent)
 				if err != nil {
 					return err
@@ -925,7 +1364,7 @@ func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Rea
 	}
 	streamed := parseResponseOutputItems(outputItems)
 	if full.Len() == 0 && streamed.Text != "" {
-		sent, err := streamDeltaText(ctx, w, streamed.Text, shouldStop)
+		sent, err := streamDeltaText(ctx, w, streamed.Text, persist, shouldStop)
 		full.WriteString(sent)
 		if err != nil {
 			return responsesRoundResult{Text: full.String(), Output: streamed.Output, ToolCalls: streamed.ToolCalls}, err
@@ -934,6 +1373,9 @@ func readResponsesStream(ctx context.Context, w http.ResponseWriter, body io.Rea
 	result.Text = full.String()
 	result.Output = streamed.Output
 	result.ToolCalls = streamed.ToolCalls
+	if persist != nil {
+		persist(result.Text, true)
+	}
 	return result, nil
 }
 
@@ -1062,18 +1504,68 @@ func appendToolStep(steps *[]responseToolStep, step responseToolStep) {
 	*steps = append(*steps, step)
 }
 
+func persistToolMetadataSnapshot(steps *[]responseToolStep, persist func([]responseToolStep)) {
+	if steps == nil || persist == nil {
+		return
+	}
+	snapshot := append([]responseToolStep(nil), (*steps)...)
+	persist(snapshot)
+}
+
+func isSuccessfulImageToolOutput(name, output string) bool {
+	if name != "image_generate" && name != "image_edit" {
+		return false
+	}
+	var payload struct {
+		OK     bool                   `json:"ok"`
+		Images []imageToolResultImage `json:"images"`
+	}
+	if err := json.Unmarshal([]byte(output), &payload); err != nil {
+		return false
+	}
+	return payload.OK && len(payload.Images) > 0
+}
+
+func hasSuccessfulImageToolStep(steps []responseToolStep) bool {
+	for _, step := range steps {
+		if step.Status == "completed" && isSuccessfulImageToolOutput(step.Name, step.Output) {
+			return true
+		}
+	}
+	return false
+}
+
 func assistantMetadataWithToolSteps(steps []responseToolStep) string {
-	if len(steps) == 0 {
+	return assistantMetadataWithToolStepsAndMemoryHits(steps, memoryHitPayload{})
+}
+
+func assistantMetadataWithToolStepsAndMemoryHits(steps []responseToolStep, hits memoryHitPayload) string {
+	if len(steps) == 0 && len(hits.Memories) == 0 {
 		return "{}"
 	}
-	return mustJSONString(map[string]interface{}{"tool_steps": steps})
+	metadata := map[string]interface{}{}
+	if len(steps) > 0 {
+		metadata["tool_steps"] = steps
+	}
+	if len(hits.Memories) > 0 {
+		metadata["memory_hits"] = hits
+	}
+	return mustJSONString(metadata)
 }
 
 func (s *Server) executeResponseTool(call responseToolCall, mode string) string {
+	return s.executeResponseToolWithContext(call, mode, responseToolContext{})
+}
+
+func (s *Server) executeResponseToolWithContext(call responseToolCall, mode string, toolCtx responseToolContext) string {
 	toolMode := normalizeSearchToolMode(mode)
 	switch strings.TrimSpace(call.Name) {
 	case "get_current_time":
 		return executeGetCurrentTimeTool(call.Arguments)
+	case "image_generate":
+		return s.executeImageGenerateToolWithContext(call.Arguments, toolCtx)
+	case "image_edit":
+		return s.executeImageEditTool(call, toolCtx)
 	case "web_search":
 		if toolMode != searchToolModeUniFuncs {
 			return disabledToolJSON("web_search", "web_search is disabled because Searching mode is active")

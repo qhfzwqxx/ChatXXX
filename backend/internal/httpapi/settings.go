@@ -8,6 +8,24 @@ import (
 )
 
 const defaultWebSearchCardResultCount = 4
+const (
+	defaultImageToolMode           = imageToolModeImageAPI
+	defaultImageToolBaseURL        = "https://api.tu-zi.com"
+	defaultImageGenerateModel      = "gpt-image-2"
+	defaultImageEditModel          = "gpt-image-1.5"
+	defaultImageResponsesModel     = "gpt-5.5"
+	defaultImageChatModel          = "gpt-4o-image"
+	defaultImageGenerateSize       = "1024x1024"
+	defaultImageEditSize           = "1:1"
+	defaultImageToolQuality        = "auto"
+	defaultImageToolResponseFormat = "url"
+)
+
+const (
+	imageToolModeImageAPI        = "image_api"
+	imageToolModeResponses       = "responses"
+	imageToolModeChatCompletions = "chat_completions"
+)
 
 const (
 	searchToolModeUniFuncs  = "unifuncs"
@@ -23,6 +41,24 @@ var adminSettingKeys = []string{
 	"searching_api_key",
 	"searching_model",
 	"searching_api_id",
+	"image_tool_mode",
+	"image_tool_base_url",
+	"image_tool_api_key",
+	"image_generate_model",
+	"image_edit_model",
+	"image_responses_model",
+	"image_chat_model",
+	"image_default_size",
+	"image_edit_size",
+	"image_default_quality",
+	"image_response_format",
+	"title_provider_id",
+	"memory_provider_id",
+	"embedding_provider_id",
+	"memory_recent_message_limit",
+	"memory_max_actions_per_run",
+	"memory_inject_limit",
+	"embedding_top_k",
 }
 
 type appSetting struct {
@@ -53,6 +89,23 @@ func (s *Server) handleAdminGetSettings(w http.ResponseWriter, r *http.Request) 
 	if strings.TrimSpace(values["search_tool_mode"].Value) == "" {
 		values["search_tool_mode"] = appSetting{Key: "search_tool_mode", Value: searchToolModeUniFuncs}
 	}
+	defaults := map[string]string{
+		"image_tool_mode":       defaultImageToolMode,
+		"image_tool_base_url":   defaultImageToolBaseURL,
+		"image_generate_model":  defaultImageGenerateModel,
+		"image_edit_model":      defaultImageEditModel,
+		"image_responses_model": defaultImageResponsesModel,
+		"image_chat_model":      defaultImageChatModel,
+		"image_default_size":    defaultImageGenerateSize,
+		"image_edit_size":       defaultImageEditSize,
+		"image_default_quality": defaultImageToolQuality,
+		"image_response_format": defaultImageToolResponseFormat,
+	}
+	for key, value := range defaults {
+		if strings.TrimSpace(values[key].Value) == "" {
+			values[key] = appSetting{Key: key, Value: value}
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"settings": values})
 }
 
@@ -74,6 +127,24 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		SearchingAPIKey          string `json:"searching_api_key"`
 		SearchingModel           string `json:"searching_model"`
 		SearchingAPIID           string `json:"searching_api_id"`
+		ImageToolMode            string `json:"image_tool_mode"`
+		ImageToolBaseURL         string `json:"image_tool_base_url"`
+		ImageToolAPIKey          string `json:"image_tool_api_key"`
+		ImageGenerateModel       string `json:"image_generate_model"`
+		ImageEditModel           string `json:"image_edit_model"`
+		ImageResponsesModel      string `json:"image_responses_model"`
+		ImageChatModel           string `json:"image_chat_model"`
+		ImageDefaultSize         string `json:"image_default_size"`
+		ImageEditSize            string `json:"image_edit_size"`
+		ImageDefaultQuality      string `json:"image_default_quality"`
+		ImageResponseFormat      string `json:"image_response_format"`
+		TitleProviderID          string `json:"title_provider_id"`
+		MemoryProviderID         string `json:"memory_provider_id"`
+		EmbeddingProviderID      string `json:"embedding_provider_id"`
+		MemoryRecentMessageLimit string `json:"memory_recent_message_limit"`
+		MemoryMaxActionsPerRun   string `json:"memory_max_actions_per_run"`
+		MemoryInjectLimit        string `json:"memory_inject_limit"`
+		EmbeddingTopK            string `json:"embedding_top_k"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "INVALID_JSON", "请求体必须是 JSON")
@@ -89,9 +160,27 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		"searching_api_key":            strings.TrimSpace(req.SearchingAPIKey),
 		"searching_model":              strings.TrimSpace(req.SearchingModel),
 		"searching_api_id":             strings.TrimSpace(req.SearchingAPIID),
+		"image_tool_mode":              normalizeImageToolMode(req.ImageToolMode),
+		"image_tool_base_url":          normalizeImageToolBaseURL(req.ImageToolBaseURL),
+		"image_tool_api_key":           strings.TrimSpace(req.ImageToolAPIKey),
+		"image_generate_model":         normalizeImageModel(req.ImageGenerateModel, defaultImageGenerateModel),
+		"image_edit_model":             normalizeImageModel(req.ImageEditModel, defaultImageEditModel),
+		"image_responses_model":        normalizeImageMainlineModel(req.ImageResponsesModel, defaultImageResponsesModel),
+		"image_chat_model":             normalizeImageMainlineModel(req.ImageChatModel, defaultImageChatModel),
+		"image_default_size":           normalizeImageGenerateSize(req.ImageDefaultSize, defaultImageGenerateSize),
+		"image_edit_size":              normalizeImageEditSize(req.ImageEditSize, defaultImageEditSize),
+		"image_default_quality":        normalizeImageQuality(req.ImageDefaultQuality, defaultImageToolQuality),
+		"image_response_format":        normalizeImageResponseFormat(req.ImageResponseFormat, defaultImageToolResponseFormat),
+		"title_provider_id":            strconv.Itoa(clampSettingInt(req.TitleProviderID, 0, 0, 1_000_000)),
+		"memory_provider_id":           strconv.Itoa(clampSettingInt(req.MemoryProviderID, 0, 0, 1_000_000)),
+		"embedding_provider_id":        strconv.Itoa(clampSettingInt(req.EmbeddingProviderID, 0, 0, 1_000_000)),
+		"memory_recent_message_limit":  strconv.Itoa(clampSettingInt(req.MemoryRecentMessageLimit, 12, 2, 50)),
+		"memory_max_actions_per_run":   strconv.Itoa(clampSettingInt(req.MemoryMaxActionsPerRun, 5, 1, 20)),
+		"memory_inject_limit":          strconv.Itoa(clampSettingInt(req.MemoryInjectLimit, 20, 1, 50)),
+		"embedding_top_k":              strconv.Itoa(clampSettingInt(req.EmbeddingTopK, 8, 1, 50)),
 	}
 	for key, value := range items {
-		if key != "search_tool_mode" && strings.TrimSpace(value) == "" {
+		if key != "search_tool_mode" && !isPersistentSetting(key) && strings.TrimSpace(value) == "" {
 			_, _ = s.store.DB.Exec(`DELETE FROM app_settings WHERE key=?`, key)
 			continue
 		}
@@ -102,6 +191,15 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		`, key, value, now, now)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
+}
+
+func isPersistentSetting(key string) bool {
+	switch key {
+	case "title_provider_id", "memory_provider_id", "embedding_provider_id", "memory_recent_message_limit", "memory_max_actions_per_run", "memory_inject_limit", "embedding_top_k", "web_search_card_result_count", "image_tool_mode", "image_tool_base_url", "image_generate_model", "image_edit_model", "image_responses_model", "image_chat_model", "image_default_size", "image_edit_size", "image_default_quality", "image_response_format":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) webSearchCardResultCount() int {
@@ -136,4 +234,18 @@ func clampWebSearchCardResultCount(value string) int {
 	default:
 		return 10
 	}
+}
+
+func clampSettingInt(value string, fallback, minValue, maxValue int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		parsed = fallback
+	}
+	if parsed < minValue {
+		return minValue
+	}
+	if parsed > maxValue {
+		return maxValue
+	}
+	return parsed
 }

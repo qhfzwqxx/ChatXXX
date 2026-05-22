@@ -5,11 +5,15 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
+
+	"github.com/go-chi/chi/v5"
 )
 
 type Conversation struct {
 	ID                int64  `json:"id"`
+	SessionID         string `json:"session_id"`
 	UserID            int64  `json:"user_id"`
 	Title             string `json:"title"`
 	SystemPrompt      string `json:"system_prompt"`
@@ -50,11 +54,13 @@ type conversationRequest struct {
 	ArchiveCategoryID int64  `json:"archive_category_id"`
 }
 
+var conversationSessionIDPattern = regexp.MustCompile(`^[a-f0-9]{32,64}$`)
+
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	archived := r.URL.Query().Get("archived") == "1"
 	rows, err := s.store.DB.Query(`
-		SELECT id, user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at
+		SELECT id, session_id, user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at
 		FROM conversations
 		WHERE user_id = ? AND deleted_at IS NULL AND archived = ?
 		ORDER BY pinned DESC, updated_at DESC, id DESC
@@ -82,10 +88,11 @@ func (s *Server) handleCreateConversation(w http.ResponseWriter, r *http.Request
 		title = "新对话"
 	}
 	now := db.Now()
+	sessionID := s.newConversationSessionID()
 	res, err := s.store.DB.Exec(`
-		INSERT INTO conversations (user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at)
-		VALUES (?, ?, '', '', 1, 0, 0, 0, ?, ?)
-	`, user.ID, title, now, now)
+		INSERT INTO conversations (session_id, user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at)
+		VALUES (?, ?, ?, '', '', 1, 0, 0, 0, ?, ?)
+	`, sessionID, user.ID, title, now, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SERVER_ERROR", "创建会话失败")
 		return
@@ -108,6 +115,26 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	messages, err := s.listMessages(id, user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "SERVER_ERROR", "读取消息失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"conversation": c, "messages": messages})
+}
+
+func (s *Server) handleGetConversationBySession(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r)
+	sessionID := strings.TrimSpace(chi.URLParam(r, "sessionID"))
+	if !validConversationSessionID(sessionID) {
+		writeError(w, http.StatusBadRequest, "INVALID_SESSION", "无效会话 Session")
+		return
+	}
+	c, err := s.getConversationForUserBySession(sessionID, user.ID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "NOT_FOUND", "会话不存在")
+		return
+	}
+	messages, err := s.listMessages(c.ID, user.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "SERVER_ERROR", "读取消息失败")
 		return
@@ -171,6 +198,19 @@ func (s *Server) handleDeleteConversation(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
 
+func (s *Server) handleClearConversations(w http.ResponseWriter, r *http.Request) {
+	user := currentUser(r)
+	now := db.Now()
+	_, _ = s.store.DB.Exec(`UPDATE generation_runs SET status='stopping', updated_at=? WHERE user_id=? AND status IN ('running','stopping')`, now, user.ID)
+	res, err := s.store.DB.Exec(`UPDATE conversations SET deleted_at=?, updated_at=? WHERE user_id=? AND deleted_at IS NULL`, now, now, user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "SERVER_ERROR", "清除历史对话失败")
+		return
+	}
+	count, _ := res.RowsAffected()
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "deleted": count})
+}
+
 func (s *Server) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
 	user := currentUser(r)
 	id, ok := paramID(r, "id")
@@ -188,16 +228,24 @@ func (s *Server) handleSwitchMessageVersion(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) getConversationForUser(id, userID int64) (*Conversation, error) {
 	row := s.store.DB.QueryRow(`
-		SELECT id, user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at
+		SELECT id, session_id, user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at
 		FROM conversations WHERE id=? AND user_id=? AND deleted_at IS NULL
 	`, id, userID)
+	return scanConversation(row)
+}
+
+func (s *Server) getConversationForUserBySession(sessionID string, userID int64) (*Conversation, error) {
+	row := s.store.DB.QueryRow(`
+		SELECT id, session_id, user_id, title, system_prompt, summary, memory_enabled, pinned, archived, archive_category_id, created_at, updated_at
+		FROM conversations WHERE session_id=? AND user_id=? AND deleted_at IS NULL
+	`, sessionID, userID)
 	return scanConversation(row)
 }
 
 func scanConversation(row *sql.Row) (*Conversation, error) {
 	var c Conversation
 	var memory, pinned, archived int
-	err := row.Scan(&c.ID, &c.UserID, &c.Title, &c.SystemPrompt, &c.Summary, &memory, &pinned, &archived, &c.ArchiveCategoryID, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.SessionID, &c.UserID, &c.Title, &c.SystemPrompt, &c.Summary, &memory, &pinned, &archived, &c.ArchiveCategoryID, &c.CreatedAt, &c.UpdatedAt)
 	c.MemoryEnabled = memory == 1
 	c.Pinned = pinned == 1
 	c.Archived = archived == 1
@@ -211,11 +259,27 @@ type rowScanner interface {
 func scanConversationRows(row rowScanner) (Conversation, error) {
 	var c Conversation
 	var memory, pinned, archived int
-	err := row.Scan(&c.ID, &c.UserID, &c.Title, &c.SystemPrompt, &c.Summary, &memory, &pinned, &archived, &c.ArchiveCategoryID, &c.CreatedAt, &c.UpdatedAt)
+	err := row.Scan(&c.ID, &c.SessionID, &c.UserID, &c.Title, &c.SystemPrompt, &c.Summary, &memory, &pinned, &archived, &c.ArchiveCategoryID, &c.CreatedAt, &c.UpdatedAt)
 	c.MemoryEnabled = memory == 1
 	c.Pinned = pinned == 1
 	c.Archived = archived == 1
 	return c, err
+}
+
+func (s *Server) newConversationSessionID() string {
+	for i := 0; i < 8; i++ {
+		sessionID := randomID()
+		var exists int
+		err := s.store.DB.QueryRow(`SELECT 1 FROM conversations WHERE session_id=? LIMIT 1`, sessionID).Scan(&exists)
+		if err == sql.ErrNoRows {
+			return sessionID
+		}
+	}
+	return randomID()
+}
+
+func validConversationSessionID(sessionID string) bool {
+	return conversationSessionIDPattern.MatchString(strings.TrimSpace(sessionID))
 }
 
 func (s *Server) listMessages(conversationID, userID int64) ([]Message, error) {
@@ -314,6 +378,13 @@ func (s *Server) updateMessageContentWithMetadata(id int64, content, status, met
 	_, _ = s.store.DB.Exec(`UPDATE messages SET content=?, status=?, metadata=?, updated_at=? WHERE id=?`, content, status, metadata, db.Now(), id)
 }
 
+func (s *Server) updateMessageMetadata(id int64, metadata string) {
+	if strings.TrimSpace(metadata) == "" {
+		metadata = "{}"
+	}
+	_, _ = s.store.DB.Exec(`UPDATE messages SET metadata=?, updated_at=? WHERE id=?`, metadata, db.Now(), id)
+}
+
 func (s *Server) updateUserMessageContent(id, userID int64, content, metadata string) error {
 	return s.updateUserMessageContentWithAttachments(id, userID, content, metadata, "")
 }
@@ -344,8 +415,8 @@ func titleFromContent(content string) string {
 		return "新对话"
 	}
 	runes := []rune(title)
-	if len(runes) > 24 {
-		title = string(runes[:24]) + "..."
+	if len(runes) > titleFallbackMaxRunes {
+		title = string(runes[:titleFallbackMaxRunes]) + "..."
 	}
 	return title
 }

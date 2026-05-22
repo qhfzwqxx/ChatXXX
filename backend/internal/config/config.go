@@ -15,6 +15,8 @@ type Config struct {
 	AppEnv          string
 	UniFuncsAPIKey  string
 	UniFuncsBaseURL string
+	WorkspacePath   string
+	PublicBaseURL   string
 }
 
 func Load() Config {
@@ -31,6 +33,8 @@ func Load() Config {
 		AppEnv:          env("APP_ENV", "development"),
 		UniFuncsAPIKey:  env("UNIFUNCS_API_KEY", ""),
 		UniFuncsBaseURL: env("UNIFUNCS_BASE_URL", "https://api.unifuncs.com"),
+		WorkspacePath:   resolvePath(env("WORKSPACE_PATH", "../workspaces"), baseDir),
+		PublicBaseURL:   strings.TrimRight(env("PUBLIC_BASE_URL", ""), "/"),
 	}
 }
 

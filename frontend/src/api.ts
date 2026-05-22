@@ -47,6 +47,24 @@ export const api = {
     searching_api_key: string;
     searching_model: string;
     searching_api_id: string;
+    image_tool_mode: string;
+    image_tool_base_url: string;
+    image_tool_api_key: string;
+    image_generate_model: string;
+    image_edit_model: string;
+    image_responses_model: string;
+    image_chat_model: string;
+    image_default_size: string;
+    image_edit_size: string;
+    image_default_quality: string;
+    image_response_format: string;
+    title_provider_id?: string;
+    memory_provider_id: string;
+    embedding_provider_id: string;
+    memory_recent_message_limit: string;
+    memory_max_actions_per_run: string;
+    memory_inject_limit: string;
+    embedding_top_k: string;
   }) =>
     request<{ ok: boolean }>('/api/admin/settings', { method: 'PATCH', body: JSON.stringify(payload) }),
   clientSettings: () => request<{ settings: { web_search_card_result_count: number } }>('/api/settings'),
@@ -57,13 +75,26 @@ export const api = {
   createConversation: () =>
     request<{ conversation: Conversation }>('/api/conversations', { method: 'POST', body: JSON.stringify({ title: '新对话' }) }),
   conversation: (id: number) => request<{ conversation: Conversation; messages: Message[] }>(`/api/conversations/${id}`),
+  conversationBySession: (sessionID: string) =>
+    request<{ conversation: Conversation; messages: Message[] }>(`/api/conversations/session/${encodeURIComponent(sessionID)}`),
   updateConversation: (id: number, payload: Partial<Conversation>) =>
     request<{ conversation: Conversation }>(`/api/conversations/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  clearConversations: () => request<{ ok: boolean; deleted: number }>('/api/conversations', { method: 'DELETE' }),
   deleteConversation: (id: number) => request<{ ok: boolean }>(`/api/conversations/${id}`, { method: 'DELETE' }),
   stopGeneration: (payload: { run_id?: string; assistant_message_id?: number; content?: string }) =>
     request<{ ok: boolean }>('/api/chat/stop', { method: 'POST', body: JSON.stringify(payload) }),
-  memories: () => request<{ memories: Memory[]; total: number; enabled_count: number }>('/api/memories'),
-  createMemory: (content: string) => request<{ memory: Memory }>('/api/memories', { method: 'POST', body: JSON.stringify({ content }) })
+  memories: () =>
+    request<{
+      memories: Memory[];
+      total: number;
+      enabled_count: number;
+      manual_count: number;
+      auto_count: number;
+      embedding: { enabled: boolean; model: string; pending_count: number };
+    }>('/api/memories'),
+  updateMemory: (id: number, payload: { enabled: boolean }) =>
+    request<{ memory: Memory }>(`/api/memories/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  deleteMemory: (id: number) => request<{ ok: boolean }>(`/api/memories/${id}`, { method: 'DELETE' })
 };
 
 export async function streamChat(
@@ -87,7 +118,15 @@ export async function streamChat(
     signal: options.signal
   });
   if (!res.ok || !res.body) {
-    throw new Error('流式请求失败');
+    let message = '连接中断，正在同步会话';
+    try {
+      const text = await res.text();
+      const json = text ? (JSON.parse(text) as Envelope<unknown>) : null;
+      if (json?.message) message = json.message;
+    } catch {
+      // Keep the recovery-friendly default when the upstream sent a non-JSON error page.
+    }
+    throw new Error(message);
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -105,6 +144,7 @@ export async function streamChat(
         if (line.startsWith('event:')) event = line.slice(6).trim();
         if (line.startsWith('data:')) data = line.slice(5).trim();
       }
+      if (event === 'ping') continue;
       try {
         onEvent(event, JSON.parse(data));
       } catch {

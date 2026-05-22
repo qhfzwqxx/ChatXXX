@@ -3,11 +3,15 @@ import { createRoot } from 'react-dom/client';
 import {
   Archive,
   ArrowUp,
+  Activity,
+  BookMarked,
   Check,
   ChevronDown,
   ChevronLeft,
+  CircleCheck,
   Copy,
   Edit3,
+  LayoutDashboard,
   LogOut,
   Menu,
   Plus,
@@ -16,6 +20,8 @@ import {
   Settings,
   SquarePen,
   Sparkles,
+  Trash2,
+  Wrench,
   X
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
@@ -24,12 +30,14 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { api, streamChat } from './api';
-import type { AttachmentPayload, Conversation, Memory, Message, Provider, User } from './types';
+import type { AttachmentPayload, Conversation, Memory, MemoryHit, MemoryHitPayload, Message, Provider, User } from './types';
 import './styles.css';
 
 type AuthMode = 'login' | 'register';
 
 const MAX_ATTACHMENT_BYTES = 512 * 1024;
+const MAX_IMAGE_ATTACHMENT_BYTES = 4 * 1024 * 1024;
+const IMAGE_ATTACHMENT_TARGET_SIZE = 1024;
 const DEFAULT_PROVIDER_CAPABILITIES = '{"input":{"text":true},"output":{"text":true},"features":{"stream":true}}';
 
 type ComposerAttachment = AttachmentPayload & {
@@ -39,8 +47,30 @@ type ComposerAttachment = AttachmentPayload & {
 type ActiveStream = {
   controller: AbortController;
   runID: string;
+  conversationID: number;
   localAssistantID: number;
   assistantMessageID: number;
+  detached?: boolean;
+};
+
+type RecoveredStreamBuffer = {
+  queue: string[];
+  targetContent: string;
+  finalMessage?: Message;
+};
+
+type RecoveredStreamPatch = {
+  messageID: number;
+  text: string;
+  finalMessage?: Message;
+};
+
+type ConfirmDialogState = {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  tone?: 'default' | 'danger';
+  onConfirm: () => Promise<void> | void;
 };
 
 type AdminSettings = {
@@ -52,7 +82,27 @@ type AdminSettings = {
   searching_api_key: string;
   searching_model: string;
   searching_api_id: string;
+  image_tool_mode: string;
+  image_tool_base_url: string;
+  image_tool_api_key: string;
+  image_generate_model: string;
+  image_edit_model: string;
+  image_responses_model: string;
+  image_chat_model: string;
+  image_default_size: string;
+  image_edit_size: string;
+  image_default_quality: string;
+  image_response_format: string;
+  title_provider_id: string;
+  memory_provider_id: string;
+  embedding_provider_id: string;
+  memory_recent_message_limit: string;
+  memory_max_actions_per_run: string;
+  memory_inject_limit: string;
+  embedding_top_k: string;
 };
+
+type AdminTab = 'overview' | 'models' | 'tools' | 'memory' | 'runtime';
 
 const emptyAdminSettings: AdminSettings = {
   search_tool_mode: 'unifuncs',
@@ -62,8 +112,30 @@ const emptyAdminSettings: AdminSettings = {
   searching_base_url: '',
   searching_api_key: '',
   searching_model: '',
-  searching_api_id: ''
+  searching_api_id: '',
+  image_tool_mode: 'image_api',
+  image_tool_base_url: 'https://api.tu-zi.com',
+  image_tool_api_key: '',
+  image_generate_model: 'gpt-image-2',
+  image_edit_model: 'gpt-image-1.5',
+  image_responses_model: 'gpt-5.5',
+  image_chat_model: 'gpt-4o-image',
+  image_default_size: '1024x1024',
+  image_edit_size: '1:1',
+  image_default_quality: 'auto',
+  image_response_format: 'url',
+  title_provider_id: '0',
+  memory_provider_id: '0',
+  embedding_provider_id: '0',
+  memory_recent_message_limit: '12',
+  memory_max_actions_per_run: '5',
+  memory_inject_limit: '20',
+  embedding_top_k: '8'
 };
+
+const recoveredStreamDelay = 35;
+const recoveredStreamInitialPollDelay = 700;
+const recoveredStreamPollDelay = 700;
 
 type ToolStep = {
   name: string;
@@ -95,6 +167,14 @@ type WebSearchResult = {
   site_name?: string;
   siteName?: string;
   date?: string;
+};
+
+type ImageToolOutput = {
+  ok?: boolean;
+  tool?: string;
+  created?: number;
+  images?: Array<{ url?: string; b64_json?: string }>;
+  error?: string;
 };
 
 type ProviderFormState = {
@@ -156,6 +236,27 @@ function WeChatBrowserBlocker() {
       </section>
     </main>
   );
+}
+
+function conversationSessionFromPath() {
+  const match = window.location.pathname.match(/^\/chat\/([a-f0-9]{32,64})\/?$/i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function conversationPath(conversation: Conversation | null) {
+  return conversation?.session_id ? `/chat/${conversation.session_id}` : '/';
+}
+
+function updateConversationURL(conversation: Conversation | null, options: { replace?: boolean } = {}) {
+  if (window.location.pathname.startsWith('/admin')) return;
+  const nextPath = conversationPath(conversation);
+  if (window.location.pathname === nextPath) return;
+  const nextURL = nextPath + window.location.search + window.location.hash;
+  if (options.replace) {
+    window.history.replaceState({}, '', nextURL);
+  } else {
+    window.history.pushState({}, '', nextURL);
+  }
 }
 
 function AuthScreen({
@@ -256,11 +357,15 @@ function App() {
   const [editingDraft, setEditingDraft] = useState('');
   const [copiedMessageIds, setCopiedMessageIds] = useState<Record<number, boolean>>({});
   const [toolStepsByMessageId, setToolStepsByMessageId] = useState<Record<number, ToolStep[]>>({});
+  const [memoryHitsByMessageId, setMemoryHitsByMessageId] = useState<Record<number, MemoryHitPayload>>({});
   const [webSearchCardResultCount, setWebSearchCardResultCount] = useState(4);
   const [streaming, setStreaming] = useState(false);
+  const [streamingConversationIds, setStreamingConversationIds] = useState<Record<number, boolean>>({});
   const [status, setStatus] = useState('');
   const [streamController, setStreamController] = useState<AbortController | null>(null);
   const activeStreamRef = useRef<ActiveStream | null>(null);
+  const currentSessionRef = useRef<string>('');
+  const messagesRef = useRef<Message[]>([]);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const composerScrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -275,10 +380,28 @@ function App() {
   const messageListScrollLockedRef = useRef(false);
   const copiedTimerRefs = useRef<Record<number, number>>({});
   const refreshPendingTimerRef = useRef<number | null>(null);
+  const memoryRefreshTimerRefs = useRef<number[]>([]);
+  const conversationRefreshTimerRefs = useRef<number[]>([]);
+  const recoveredStreamBuffersRef = useRef<Record<number, RecoveredStreamBuffer>>({});
+  const recoveredStreamTimerRefs = useRef<Record<number, number>>({});
+  const messageListAutoScrollFrameRef = useRef<number | null>(null);
+  const messageListAutoScrollingRef = useRef(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const currentConversationStreaming = !!current && !!streamingConversationIds[current.id];
+  const currentConversationStreamingMessage = useMemo(
+    () => messages.find((message) => message.role === 'assistant' && message.status === 'streaming'),
+    [messages]
+  );
+  const hasCurrentStreamingMessage = messages.some((message) => message.status === 'streaming');
+  const composerStopping = currentConversationStreaming || !!currentConversationStreamingMessage;
+  const activeProvider = useMemo(() => providers.find((provider) => provider.id === providerId), [providers, providerId]);
+  const providerName = activeProvider ? activeProvider.name : 'BT';
+  const avatar = (user?.name || user?.email || '用').slice(0, 1).toUpperCase();
 
   useEffect(() => {
     api.me()
@@ -293,11 +416,38 @@ function App() {
   }, [user]);
 
   useEffect(() => {
+    if (!user) return;
+    function handlePopState() {
+      const sessionID = conversationSessionFromPath();
+      void openConversationFromSession(sessionID, { replace: true });
+    }
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [user]);
+
+  useEffect(() => {
     const mobileSidebarOpen = sidebarOpen && window.matchMedia('(max-width: 900px)').matches;
     const overlayOpen = mobileSidebarOpen || userMenuOpen || modelMenuOpen || memoryOpen;
     document.body.classList.toggle('chat-overlay-open', overlayOpen);
     return () => document.body.classList.remove('chat-overlay-open');
   }, [sidebarOpen, userMenuOpen, modelMenuOpen, memoryOpen]);
+
+  useEffect(() => {
+    function isEditableTarget(target: EventTarget | null) {
+      const element = target instanceof HTMLElement ? target : null;
+      return !!element?.closest('input, textarea, select, [contenteditable="true"]');
+    }
+    function preventTextSelection(event: Event) {
+      if (isEditableTarget(event.target)) return;
+      event.preventDefault();
+    }
+    document.addEventListener('selectstart', preventTextSelection);
+    document.addEventListener('contextmenu', preventTextSelection);
+    return () => {
+      document.removeEventListener('selectstart', preventTextSelection);
+      document.removeEventListener('contextmenu', preventTextSelection);
+    };
+  }, []);
 
   // Block global rubber-band overscroll: only allow scroll inside our containers
   useEffect(() => {
@@ -316,35 +466,62 @@ function App() {
     return () => {
       Object.values(copiedTimerRefs.current).forEach((timer) => window.clearTimeout(timer));
       if (refreshPendingTimerRef.current) window.clearTimeout(refreshPendingTimerRef.current);
+      memoryRefreshTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+      memoryRefreshTimerRefs.current = [];
+      conversationRefreshTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+      conversationRefreshTimerRefs.current = [];
+      Object.values(recoveredStreamTimerRefs.current).forEach((timer) => window.clearTimeout(timer));
+      recoveredStreamTimerRefs.current = {};
+      recoveredStreamBuffersRef.current = {};
+      if (messageListAutoScrollFrameRef.current) window.cancelAnimationFrame(messageListAutoScrollFrameRef.current);
+      messageListAutoScrollFrameRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     resizeComposerInput();
   }, [draft]);
 
   useEffect(() => {
-    if (streaming || !current || !messages.some((message) => message.status === 'streaming')) return;
-    if (refreshPendingTimerRef.current) window.clearTimeout(refreshPendingTimerRef.current);
+    if (!composerStopping || !current || !hasCurrentStreamingMessage) return;
+    const active = activeStreamRef.current;
+    if (active && !active.detached && active.conversationID === current.id) return;
+    if (refreshPendingTimerRef.current) return;
     refreshPendingTimerRef.current = window.setTimeout(() => {
       void refreshConversationUntilSettled(current.id);
-    }, 1200);
+    }, recoveredStreamInitialPollDelay);
     return () => {
       if (refreshPendingTimerRef.current) {
         window.clearTimeout(refreshPendingTimerRef.current);
         refreshPendingTimerRef.current = null;
       }
     };
-  }, [current?.id, messages, streaming]);
+  }, [current?.id, composerStopping, hasCurrentStreamingMessage]);
+
+  useEffect(() => {
+    if (!current) return;
+    setStreamingConversationIds((items) => {
+      const hasStreamingMessage = messages.some((message) => message.role === 'assistant' && message.status === 'streaming');
+      if (hasStreamingMessage) {
+        if (items[current.id]) return items;
+        return { ...items, [current.id]: true };
+      }
+      if (!items[current.id]) return items;
+      const next = { ...items };
+      delete next[current.id];
+      return next;
+    });
+  }, [current?.id, messages]);
 
   useLayoutEffect(() => {
     const list = messageListRef.current;
     if (!list) return;
     if (forceScrollToBottomRef.current || (shouldStickToBottomRef.current && !userInteractingWithMessagesRef.current)) {
-      list.scrollTop = list.scrollHeight;
-      lastMessageScrollTopRef.current = list.scrollTop;
-      shouldStickToBottomRef.current = true;
-      forceScrollToBottomRef.current = false;
+      scheduleMessageListScrollToBottom();
     }
   }, [current?.id, messages]);
 
@@ -361,8 +538,17 @@ function App() {
     setProviderId((value) => value || capsRes.capabilities.default_provider_id || nextProviders[0]?.id || 0);
     setMemories(memRes.memories || []);
     setWebSearchCardResultCount(settingsRes.settings.web_search_card_result_count || 4);
-    if (!current && convRes.conversations[0]) {
-      await openConversation(convRes.conversations[0]);
+    if (!current) {
+      const sessionID = conversationSessionFromPath();
+      if (sessionID) {
+        const opened = await openConversationFromSession(sessionID, { replace: true, conversations: convRes.conversations });
+        if (opened) return;
+      }
+      if (convRes.conversations[0]) {
+        await openConversation(convRes.conversations[0], { replace: true });
+      } else {
+        updateConversationURL(null, { replace: true });
+      }
     }
   }
 
@@ -371,38 +557,119 @@ function App() {
     setWebSearchCardResultCount(res.settings.web_search_card_result_count || 4);
   }
 
+  async function refreshConversations() {
+    const latest = await api.conversations();
+    setConversations(latest.conversations);
+    setCurrent((item) => {
+      if (!item) return item;
+      return latest.conversations.find((conversation) => conversation.id === item.id) || item;
+    });
+  }
+
   async function refreshConversationUntilSettled(conversationID: number) {
     try {
       const res = await api.conversation(conversationID);
-      setMessages((items) => (current?.id === conversationID ? res.messages : items));
+      if (current?.id === conversationID) {
+        const active = activeStreamRef.current;
+        if (active?.conversationID === conversationID && active.assistantMessageID > 0) {
+          setMessages((items) => mergeStreamingRefreshMessages(items, res.messages, active));
+        } else {
+          applyRecoveredConversationMessages(res.messages);
+        }
+      }
       const hasStreaming = res.messages.some((message) => message.status === 'streaming');
-      if (!hasStreaming) {
-        refreshPendingTimerRef.current = null;
+    if (!hasStreaming) {
+      refreshPendingTimerRef.current = null;
+      if (current?.id === conversationID) {
+        setStatus('');
+      }
+      setStreamingConversationIds((items) => {
+          if (!items[conversationID]) return items;
+          const next = { ...items };
+          delete next[conversationID];
+          return next;
+        });
+        void refreshConversations();
+        scheduleConversationRefreshes();
         return;
       }
       refreshPendingTimerRef.current = window.setTimeout(() => {
         void refreshConversationUntilSettled(conversationID);
-      }, 1800);
+      }, recoveredStreamPollDelay);
     } catch {
       refreshPendingTimerRef.current = window.setTimeout(() => {
         void refreshConversationUntilSettled(conversationID);
-      }, 2500);
+      }, 1500);
     }
   }
 
-  async function openConversation(conversation: Conversation) {
+  async function openConversation(conversation: Conversation, options: { replace?: boolean } = {}) {
+    detachActiveStreamForOtherConversation(conversation.id);
     requestScrollToBottom();
+    currentSessionRef.current = conversation.session_id || '';
     setCurrent(conversation);
+    updateConversationURL(conversation, { replace: options.replace });
     const res = await api.conversation(conversation.id);
+    currentSessionRef.current = res.conversation.session_id || conversation.session_id || '';
+    setCurrent(res.conversation);
+    updateConversationURL(res.conversation, { replace: true });
     setMessages(res.messages);
+    hydrateTimelineMetadata(res.messages);
+    setMemoryHitsByMessageId({});
+    if (res.messages.some((message) => message.role === 'assistant' && message.status === 'streaming')) {
+      void refreshConversationUntilSettled(res.conversation.id);
+    }
     closeMobileSidebar();
   }
 
+  async function openConversationFromSession(
+    sessionID: string | null,
+    options: { replace?: boolean; conversations?: Conversation[] } = {}
+  ) {
+    if (!sessionID) {
+      const fallback = options.conversations?.[0] || conversations[0];
+      if (fallback) {
+        await openConversation(fallback, { replace: options.replace });
+        return true;
+      }
+      setCurrent(null);
+      setMessages([]);
+      currentSessionRef.current = '';
+      updateConversationURL(null, { replace: options.replace });
+      return false;
+    }
+    if (currentSessionRef.current === sessionID) return true;
+    try {
+      requestScrollToBottom();
+      const res = await api.conversationBySession(sessionID);
+      detachActiveStreamForOtherConversation(res.conversation.id);
+      currentSessionRef.current = res.conversation.session_id || sessionID;
+      setCurrent(res.conversation);
+      setMessages(res.messages);
+      hydrateTimelineMetadata(res.messages);
+      setMemoryHitsByMessageId({});
+      if (res.messages.some((message) => message.role === 'assistant' && message.status === 'streaming')) {
+        void refreshConversationUntilSettled(res.conversation.id);
+      }
+      updateConversationURL(res.conversation, { replace: options.replace });
+      closeMobileSidebar();
+      return true;
+    } catch {
+      setStatus('会话不存在或无权访问');
+      updateConversationURL(null, { replace: true });
+      return false;
+    }
+  }
+
   async function newConversation() {
+    detachActiveStreamForOtherConversation(null);
     const res = await api.createConversation();
     requestScrollToBottom();
+    currentSessionRef.current = res.conversation.session_id || '';
     setCurrent(res.conversation);
+    updateConversationURL(res.conversation);
     setMessages([]);
+    setMemoryHitsByMessageId({});
     setDraft('');
     setAttachments([]);
     setEditingMessageId(null);
@@ -413,21 +680,25 @@ function App() {
   }
 
   async function send() {
+    if (composerStopping) {
+      stopStreaming();
+      return;
+    }
     const content = draft.trim();
-    if ((!content && !attachments.length) || streaming) return;
+    if (!content && !attachments.length) return;
     void refreshClientSettings();
     await runStream({ content, attachments });
   }
 
   async function regenerate(message: Message) {
-    if (streaming || !current || message.role !== 'assistant') return;
+    if (composerStopping || !current || message.role !== 'assistant') return;
     void refreshClientSettings();
     await runStream({ content: '', mode: 'regenerate', messageId: message.id });
   }
 
   async function submitEdit(message: Message, content: string) {
     const nextContent = content.trim();
-    if (streaming || !current || message.role !== 'user' || !nextContent) return;
+    if (composerStopping || !current || message.role !== 'user' || !nextContent) return;
     setEditingMessageId(null);
     setEditingDraft('');
     void refreshClientSettings();
@@ -537,6 +808,124 @@ function App() {
     forceScrollToBottomRef.current = true;
   }
 
+  function scheduleMessageListScrollToBottom() {
+    if (messageListAutoScrollFrameRef.current) return;
+    messageListAutoScrollFrameRef.current = window.requestAnimationFrame(() => {
+      messageListAutoScrollFrameRef.current = null;
+      const list = messageListRef.current;
+      if (!list) return;
+      messageListAutoScrollingRef.current = true;
+      list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
+      lastMessageScrollTopRef.current = list.scrollTop;
+      shouldStickToBottomRef.current = true;
+      forceScrollToBottomRef.current = false;
+      window.requestAnimationFrame(() => {
+        messageListAutoScrollingRef.current = false;
+      });
+    });
+  }
+
+  function applyRecoveredConversationMessages(refreshedMessages: Message[]) {
+    hydrateTimelineMetadata(refreshedMessages);
+    const merged = mergeRecoveredStreamingMessages(
+      messagesRef.current,
+      refreshedMessages,
+      (messageID) => recoveredStreamBuffersRef.current[messageID]?.targetContent
+    );
+    setMessages(merged.messages);
+    merged.patches.forEach(queueRecoveredStreamPatch);
+  }
+
+  function hydrateTimelineMetadata(nextMessages: Message[]) {
+    const nextToolSteps: Record<number, ToolStep[]> = {};
+    const nextMemoryHits: Record<number, MemoryHitPayload> = {};
+    nextMessages.forEach((message) => {
+      const steps = parseToolSteps(message.metadata);
+      if (steps.length) nextToolSteps[message.id] = steps;
+      const hits = parseMemoryHits(message.metadata);
+      if (hits?.memories?.length) nextMemoryHits[message.id] = hits;
+    });
+    setToolStepsByMessageId(nextToolSteps);
+    setMemoryHitsByMessageId(nextMemoryHits);
+  }
+
+  function queueRecoveredStreamPatch(patch: RecoveredStreamPatch) {
+    const existing = recoveredStreamBuffersRef.current[patch.messageID];
+    const currentContent =
+      existing?.targetContent ||
+      messagesRef.current.find((message) => message.id === patch.messageID)?.content ||
+      '';
+    const next: RecoveredStreamBuffer = existing || {
+      queue: [],
+      targetContent: currentContent
+    };
+    if (patch.text) {
+      next.queue.push(...Array.from(patch.text));
+      next.targetContent = currentContent + patch.text;
+    }
+    if (patch.finalMessage) {
+      next.finalMessage = patch.finalMessage;
+      next.targetContent = patch.finalMessage.content || next.targetContent;
+    }
+    recoveredStreamBuffersRef.current[patch.messageID] = next;
+    if (next.queue.length === 0) {
+      finishRecoveredStreamPatch(patch.messageID);
+      return;
+    }
+    if (!recoveredStreamTimerRefs.current[patch.messageID]) {
+      recoveredStreamTimerRefs.current[patch.messageID] = window.setTimeout(() => playRecoveredStreamPatch(patch.messageID), recoveredStreamDelay);
+    }
+  }
+
+  function playRecoveredStreamPatch(messageID: number) {
+    const entry = recoveredStreamBuffersRef.current[messageID];
+    if (!entry) {
+      delete recoveredStreamTimerRefs.current[messageID];
+      return;
+    }
+    const chunk = entry.queue.splice(0, recoveredStreamChunkRunes(entry.queue.length)).join('');
+    if (chunk) {
+      setMessages((items) =>
+        items.map((message) =>
+          message.id === messageID ? { ...message, content: message.content + chunk, status: 'streaming' } : message
+        )
+      );
+    }
+    if (entry.queue.length > 0) {
+      recoveredStreamTimerRefs.current[messageID] = window.setTimeout(() => playRecoveredStreamPatch(messageID), recoveredStreamDelay);
+      return;
+    }
+    finishRecoveredStreamPatch(messageID);
+  }
+
+  function finishRecoveredStreamPatch(messageID: number) {
+    const entry = recoveredStreamBuffersRef.current[messageID];
+    if (!entry) return;
+    const finalMessage = entry.finalMessage;
+    delete recoveredStreamBuffersRef.current[messageID];
+    if (recoveredStreamTimerRefs.current[messageID]) {
+      window.clearTimeout(recoveredStreamTimerRefs.current[messageID]);
+      delete recoveredStreamTimerRefs.current[messageID];
+    }
+    if (finalMessage) {
+      setMessages((items) =>
+        items.map((message) =>
+          message.id === messageID ? { ...finalMessage, content: finalMessage.content || message.content } : message
+        )
+      );
+    }
+  }
+
+  function detachActiveStreamForOtherConversation(nextConversationID: number | null) {
+    const active = activeStreamRef.current;
+    if (!active || active.conversationID === nextConversationID) return;
+    active.detached = true;
+    active.controller.abort();
+    activeStreamRef.current = active;
+    setStreaming(false);
+    setStreamController(null);
+  }
+
   function pauseAutoFollow() {
     shouldStickToBottomRef.current = false;
     forceScrollToBottomRef.current = false;
@@ -545,6 +934,11 @@ function App() {
   function handleMessageListScroll() {
     const list = messageListRef.current;
     if (!list) return;
+    if (messageListAutoScrollingRef.current) {
+      lastMessageScrollTopRef.current = list.scrollTop;
+      shouldStickToBottomRef.current = isMessageListNearBottom(list);
+      return;
+    }
     const scrollingTowardHistory = list.scrollTop < lastMessageScrollTopRef.current - 1;
     shouldStickToBottomRef.current = scrollingTowardHistory ? false : isMessageListNearBottom(list);
     lastMessageScrollTopRef.current = list.scrollTop;
@@ -657,9 +1051,12 @@ function App() {
     if (!conversation) {
       const res = await api.createConversation();
       conversation = res.conversation;
+      currentSessionRef.current = conversation.session_id || '';
       setCurrent(conversation);
+      updateConversationURL(conversation);
       setConversations((items) => [conversation!, ...items]);
     }
+    detachActiveStreamForOtherConversation(conversation.id);
 
     if (mode === 'send') {
       setDraft('');
@@ -705,11 +1102,21 @@ function App() {
     activeStreamRef.current = {
       controller,
       runID: '',
+      conversationID: conversation.id,
       localAssistantID: localAssistant.id,
       assistantMessageID: 0
     };
+    setStreamingConversationIds((items) => ({ ...items, [conversation!.id]: true }));
     setToolStepsByMessageId((items) => {
       const next = { ...items, [localAssistant.id]: [] };
+      if (mode === 'regenerate' && messageId) {
+        delete next[messageId];
+      }
+      return next;
+    });
+    setMemoryHitsByMessageId((items) => {
+      const next = { ...items };
+      next[localAssistant.id] = { method: '', model: '', dim: 0, memories: [] };
       if (mode === 'regenerate' && messageId) {
         delete next[messageId];
       }
@@ -731,6 +1138,7 @@ function App() {
       }
       return [...items, localUser, localAssistant];
     });
+    scheduleConversationRefreshes();
 
     try {
       await streamChat(
@@ -744,26 +1152,50 @@ function App() {
         },
         (event, data) => {
           if (event === 'message_start') {
+            const userMessage = data.user_message as Message | undefined;
+            const assistantMessage = data.assistant_message as Message | undefined;
+            const assistantMessageID = typeof assistantMessage?.id === 'number' ? assistantMessage.id : 0;
             activeStreamRef.current = {
               controller,
               runID: typeof data.run_id === 'string' ? data.run_id : '',
+              conversationID: conversation!.id,
               localAssistantID: localAssistant.id,
-              assistantMessageID: typeof data.assistant_message?.id === 'number' ? data.assistant_message.id : 0
+              assistantMessageID
             };
+            if (userMessage?.id) {
+              setMessages((items) =>
+                items.map((message) => (message.id === localUser.id ? { ...userMessage } : message.id === userMessage.id ? { ...userMessage } : message))
+              );
+            }
+            if (assistantMessageID > 0 && assistantMessage) {
+              setMessages((items) => bindStreamingAssistantMessage(items, localAssistant.id, assistantMessage));
+            }
           }
           if (event === 'delta') {
+            const active = activeStreamRef.current;
+            const assistantIDs = streamingAssistantIDs(active, localAssistant.id);
             setMessages((items) =>
-              items.map((msg) => (msg.id === localAssistant.id ? { ...msg, content: msg.content + (data.text || '') } : msg))
+              items.map((msg) => (assistantIDs.has(msg.id) ? { ...msg, content: msg.content + (data.text || '') } : msg))
             );
           }
           if (event === 'thinking') return;
           if (event === 'tool_steps') {
             const step = normalizeToolStep(data.step);
             if (step) {
+              const active = activeStreamRef.current;
+              const targetID = active?.assistantMessageID || localAssistant.id;
               setToolStepsByMessageId((items) => ({
                 ...items,
-                [localAssistant.id]: mergeToolStep(items[localAssistant.id] || [], step)
+                [targetID]: mergeToolStep(items[targetID] || items[localAssistant.id] || [], step)
               }));
+            }
+          }
+          if (event === 'memory_hits') {
+            const payload = normalizeMemoryHitPayload(data);
+            if (payload && payload.memories.length) {
+              const active = activeStreamRef.current;
+              const targetID = active?.assistantMessageID || localAssistant.id;
+              setMemoryHitsByMessageId((items) => ({ ...items, [targetID]: payload }));
             }
           }
           if (event === 'conversation_title') {
@@ -773,37 +1205,82 @@ function App() {
           if (event === 'message_end') {
             const message = data.message as Message;
             activeStreamRef.current = null;
+            setStreamingConversationIds((items) => {
+              const next = { ...items };
+              delete next[conversation!.id];
+              return next;
+            });
             const persistedSteps = parseToolSteps(message?.metadata);
+            const persistedMemoryHits = parseMemoryHits(message?.metadata);
             setToolStepsByMessageId((items) => {
               const next = { ...items };
+              const existing = message?.id ? next[message.id] : undefined;
               delete next[localAssistant.id];
               if (message?.id && persistedSteps.length) {
                 next[message.id] = persistedSteps;
+              } else if (message?.id && existing?.length) {
+                next[message.id] = existing;
               }
               return next;
             });
-            setMessages((items) => items.map((msg) => (msg.id === localAssistant.id ? data.message : msg)));
+            setMemoryHitsByMessageId((items) => {
+              const next = { ...items };
+              const hits = persistedMemoryHits || (message?.id ? next[message.id] : undefined) || next[localAssistant.id];
+              delete next[localAssistant.id];
+              if (message?.id && hits?.memories?.length) {
+                next[message.id] = hits;
+              }
+              return next;
+            });
+            setMessages((items) => items.map((msg) => (msg.id === localAssistant.id || msg.id === message?.id ? data.message : msg)));
           }
           if (event === 'error') setStatus(data.message || '生成失败');
         },
         { signal: controller.signal }
       );
+      if (activeStreamRef.current?.detached && activeStreamRef.current.conversationID === conversation.id) {
+        return;
+      }
       setStatus('');
       const res = await api.conversation(conversation.id);
       setMessages(res.messages);
-      const latest = await api.conversations();
-      setConversations(latest.conversations);
+      await refreshConversations();
+      scheduleConversationRefreshes();
+      scheduleMemoryRefreshes();
     } catch (err) {
+      const detached = activeStreamRef.current?.detached && activeStreamRef.current.conversationID === conversation.id;
+      if (err instanceof DOMException && err.name === 'AbortError' && detached) {
+        return;
+      }
       if (err instanceof DOMException && err.name === 'AbortError') {
         setStatus('');
         setMessages((items) =>
           items.map((msg) => (msg.id === localAssistant.id ? { ...msg, status: 'stopped', content: msg.content || '已停止生成' } : msg))
         );
       } else {
-        setStatus(err instanceof Error ? err.message : '生成失败');
+        const active = activeStreamRef.current;
+        const canRecover = active?.conversationID === conversation.id && (active.assistantMessageID > 0 || active.localAssistantID === localAssistant.id);
+        if (canRecover) {
+          setStatus('连接刚刚断开，正在自动同步结果');
+          setStreamingConversationIds((items) => ({ ...items, [conversation.id]: true }));
+          void refreshConversationUntilSettled(conversation.id);
+        } else {
+          setStatus(friendlyStreamErrorMessage(err));
+        }
       }
     } finally {
-      activeStreamRef.current = null;
+      const active = activeStreamRef.current;
+      const detached = active?.detached && active.conversationID === conversation.id;
+      if (!detached) {
+        setStreamingConversationIds((items) => {
+          const next = { ...items };
+          delete next[conversation!.id];
+          return next;
+        });
+      }
+      if (!active || active.conversationID === conversation.id) {
+        activeStreamRef.current = null;
+      }
       setStreamController(null);
       setStreaming(false);
     }
@@ -811,9 +1288,11 @@ function App() {
 
   async function stopStreaming() {
     const active = activeStreamRef.current;
+    const fallbackMessage = currentConversationStreamingMessage;
     const currentContent =
       messages.find((message) => message.id === active?.localAssistantID)?.content ||
       messages.find((message) => message.id === active?.assistantMessageID)?.content ||
+      fallbackMessage?.content ||
       '';
     if (active) {
       setMessages((items) =>
@@ -831,14 +1310,83 @@ function App() {
       active.controller.abort();
       return;
     }
+    if (current && fallbackMessage) {
+      setMessages((items) =>
+        items.map((msg) =>
+          msg.id === fallbackMessage.id ? { ...msg, status: 'stopped', content: msg.content || '已停止生成' } : msg
+        )
+      );
+      setStreamingConversationIds((items) => {
+        const next = { ...items };
+        delete next[current.id];
+        return next;
+      });
+      void api.stopGeneration({
+        assistant_message_id: fallbackMessage.id,
+        content: currentContent || '已停止生成'
+      });
+      return;
+    }
     streamController?.abort();
   }
 
-  async function addMemory(content: string) {
-    if (!content.trim()) return;
-    await api.createMemory(content.trim());
+  async function setMemoryEnabled(id: number, enabled: boolean) {
+    await api.updateMemory(id, { enabled });
     const res = await api.memories();
     setMemories(res.memories);
+  }
+
+  async function deleteMemory(id: number) {
+    await api.deleteMemory(id);
+    const res = await api.memories();
+    setMemories(res.memories);
+  }
+
+  function requestConfirm(dialog: ConfirmDialogState) {
+    setConfirmDialog(dialog);
+  }
+
+  async function handleConfirmDialog() {
+    if (!confirmDialog) return;
+    setConfirming(true);
+    try {
+      await confirmDialog.onConfirm();
+      setConfirmDialog(null);
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  async function refreshMemories() {
+    try {
+      const res = await api.memories();
+      setMemories(res.memories || []);
+    } catch {
+      // The memory list is auxiliary; keep the chat flow quiet if this refresh fails.
+    }
+  }
+
+  function scheduleMemoryRefreshes() {
+    memoryRefreshTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+    memoryRefreshTimerRefs.current = [];
+    void refreshMemories();
+    [1200, 3000, 6000, 10000].forEach((delay) => {
+      const timer = window.setTimeout(() => {
+        void refreshMemories();
+      }, delay);
+      memoryRefreshTimerRefs.current.push(timer);
+    });
+  }
+
+  function scheduleConversationRefreshes() {
+    conversationRefreshTimerRefs.current.forEach((timer) => window.clearTimeout(timer));
+    conversationRefreshTimerRefs.current = [];
+    [800, 1800, 3600].forEach((delay) => {
+      const timer = window.setTimeout(() => {
+        void refreshConversations();
+      }, delay);
+      conversationRefreshTimerRefs.current.push(timer);
+    });
   }
 
   function exportCurrentConversation() {
@@ -859,6 +1407,33 @@ function App() {
     setCurrent(null);
     setMessages([]);
     setConversations([]);
+    currentSessionRef.current = '';
+    updateConversationURL(null, { replace: true });
+  }
+
+  async function clearHistoryConversations() {
+    if (!conversations.length && !current) {
+      setUserMenuOpen(false);
+      return;
+    }
+    requestConfirm({
+      title: '清除历史对话',
+      message: '确定要清除所有历史对话吗？此操作不可恢复，但不会删除长期记忆。',
+      confirmLabel: '清除',
+      tone: 'danger',
+      onConfirm: async () => {
+        stopStreaming();
+        await api.clearConversations();
+        setCurrent(null);
+        setMessages([]);
+        setConversations([]);
+        setStreamingConversationIds({});
+        currentSessionRef.current = '';
+        updateConversationURL(null, { replace: true });
+        setUserMenuOpen(false);
+        closeMobileSidebar();
+      }
+    });
   }
 
   function closeMobileSidebar() {
@@ -866,10 +1441,6 @@ function App() {
       setSidebarOpen(false);
     }
   }
-
-  const activeProvider = useMemo(() => providers.find((provider) => provider.id === providerId), [providers, providerId]);
-  const providerName = activeProvider ? activeProvider.name : 'BT';
-  const avatar = (user?.name || user?.email || '用').slice(0, 1).toUpperCase();
 
   if (booting) return <div className="boot">ChatXXX</div>;
   if (!user) return <AuthScreen onAuthed={setUser} />;
@@ -905,7 +1476,7 @@ function App() {
 
         <div className="sidebar-archive-row">
           <button className="new-chat-btn archive-view-btn" type="button" onClick={() => setMemoryOpen(true)}>
-            <Archive size={18} strokeWidth={1.8} />
+            <BookMarked size={18} strokeWidth={1.8} />
             <span>记忆</span>
           </button>
         </div>
@@ -942,6 +1513,10 @@ function App() {
                   <Archive size={18} />
                   <span>导出</span>
                 </button>
+                <button className="user-action-item" type="button" disabled={!conversations.length && !current} onClick={() => void clearHistoryConversations()}>
+                  <Trash2 size={18} />
+                  <span>清除历史对话</span>
+                </button>
                 <button className="user-action-item" type="button" onClick={() => void logout()}>
                   <LogOut size={18} />
                   <span>退出</span>
@@ -974,16 +1549,6 @@ function App() {
               </button>
               {modelMenuOpen && (
                 <div className="model-menu__list" role="listbox">
-                  <button
-                    className={'model-menu__item ' + (!providerId ? 'is-current' : '')}
-                    type="button"
-                    onClick={() => { setProviderId(0); setModelMenuOpen(false); }}
-                  >
-                    <span className="model-menu__text">
-                      <span className="model-menu__label">自动选择</span>
-                    </span>
-                    {!providerId && <span className="model-menu__check">✓</span>}
-                  </button>
                   {providers.map((provider) => (
                     <button
                       key={provider.id}
@@ -995,7 +1560,11 @@ function App() {
                         <span className="model-menu__label">{provider.name}</span>
                         <span className="model-menu__meta">{provider.model}</span>
                       </span>
-                      {providerId === provider.id && <span className="model-menu__check">✓</span>}
+                      {providerId === provider.id && (
+                        <span className="model-menu__check" aria-label="当前模型">
+                          <CircleCheck size={16} strokeWidth={2.2} />
+                        </span>
+                      )}
                     </button>
                   ))}
                 </div>
@@ -1016,8 +1585,9 @@ function App() {
               isEditing={editingMessageId === message.id}
               editingDraft={editingDraft}
               copied={!!copiedMessageIds[message.id]}
-              streaming={streaming}
+              streaming={composerStopping}
               toolSteps={toolStepsByMessageId[message.id] || parseToolSteps(message.metadata)}
+              memoryHits={memoryHitsByMessageId[message.id] || parseMemoryHits(message.metadata)}
               webSearchCardResultCount={webSearchCardResultCount}
               onEditingDraftChange={setEditingDraft}
               onCopy={() => void copyMessage(message)}
@@ -1043,6 +1613,10 @@ function App() {
             className="composer-form"
             onSubmit={(event) => {
               event.preventDefault();
+              if (composerStopping) {
+                stopStreaming();
+                return;
+              }
               void send();
             }}
           >
@@ -1050,9 +1624,15 @@ function App() {
               <div className="composer-attachments">
                 {attachments.map((attachment) => (
                   <div className={'attachment-chip ' + (attachment.error ? 'has-error' : '')} key={attachment.id}>
+                    {attachment.preview && (
+                      <span className="attachment-chip__thumb">
+                        <img src={attachment.preview} alt="" />
+                      </span>
+                    )}
                     <span className="attachment-chip__name">{attachment.name}</span>
                     <span className="attachment-chip__meta">
                       {formatFileSize(attachment.size)}
+                      {attachment.width && attachment.height ? ` · ${attachment.width}x${attachment.height}` : ''}
                       {attachment.error ? ` · ${attachment.error}` : ''}
                     </span>
                     <button
@@ -1081,6 +1661,10 @@ function App() {
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
+                    if (composerStopping) {
+                      stopStreaming();
+                      return;
+                    }
                     void send();
                   }
                 }}
@@ -1089,22 +1673,60 @@ function App() {
               />
             </div>
             <button
-              className={'send-btn ' + (streaming ? 'is-stopping' : '')}
-              type={streaming ? 'button' : 'submit'}
-              disabled={!streaming && !draft.trim() && !attachments.length}
-              aria-label={streaming ? '停止生成' : '发送'}
-              onClick={streaming ? stopStreaming : undefined}
+              className={'send-btn ' + (composerStopping ? 'is-stopping' : '')}
+              type={composerStopping ? 'button' : 'submit'}
+              disabled={!composerStopping && !draft.trim() && !attachments.length}
+              aria-label={composerStopping ? '停止生成' : '发送'}
+              onClick={(event) => {
+                if (!composerStopping) return;
+                event.preventDefault();
+                event.stopPropagation();
+                stopStreaming();
+              }}
             >
-              {streaming ? <span className="stop-square" aria-hidden="true" /> : <ArrowUp size={20} strokeWidth={2.4} />}
+              {composerStopping ? <span className="stop-square" aria-hidden="true" /> : <ArrowUp className="send-arrow" size={20} strokeWidth={2.4} />}
             </button>
           </form>
         </footer>
       </section>
 
       {memoryOpen && (
-        <Modal title="记忆" onClose={() => setMemoryOpen(false)}>
-          <MemoryPanel memories={memories} onAdd={addMemory} />
+        <Modal title="记忆" onClose={() => setMemoryOpen(false)} className="memory-modal-card" backdropClassName="memory-modal-backdrop">
+          <MemoryPanel
+            memories={memories}
+            onToggle={(memory) => {
+              const nextEnabled = !memory.enabled;
+              requestConfirm({
+                title: nextEnabled ? '启用记忆' : '停用记忆',
+                message: nextEnabled
+                  ? '确定要重新启用这条长期记忆吗？之后它会参与相关对话的记忆检索。'
+                  : '确定要停用这条长期记忆吗？停用后它不会参与后续对话的记忆检索。',
+                confirmLabel: nextEnabled ? '启用' : '停用',
+                tone: nextEnabled ? 'default' : 'danger',
+                onConfirm: () => setMemoryEnabled(memory.id, nextEnabled)
+              });
+            }}
+            onDelete={(memory) => {
+              requestConfirm({
+                title: '删除记忆',
+                message: '确定要删除这条长期记忆吗？此操作不可恢复。',
+                confirmLabel: '删除',
+                tone: 'danger',
+                onConfirm: () => deleteMemory(memory.id)
+              });
+            }}
+          />
         </Modal>
+      )}
+      {confirmDialog && (
+        <ConfirmDialog
+          dialog={confirmDialog}
+          confirming={confirming}
+          onCancel={() => {
+            if (!confirming) setConfirmDialog(null);
+          }}
+          onConfirm={() => void handleConfirmDialog()}
+        />
       )}
     </main>
   );
@@ -1117,6 +1739,7 @@ function MessageBubble({
   copied,
   streaming,
   toolSteps,
+  memoryHits,
   webSearchCardResultCount,
   onEditingDraftChange,
   onCopy,
@@ -1131,6 +1754,7 @@ function MessageBubble({
   copied: boolean;
   streaming: boolean;
   toolSteps: ToolStep[];
+  memoryHits?: MemoryHitPayload;
   webSearchCardResultCount: number;
   onEditingDraftChange: (value: string) => void;
   onCopy: () => void;
@@ -1187,6 +1811,7 @@ function MessageBubble({
                 content={content}
                 streaming={isAssistantStreaming}
                 toolSteps={toolSteps}
+                memoryHits={memoryHits}
                 webSearchCardResultCount={webSearchCardResultCount}
               />
             ) : (
@@ -1253,22 +1878,29 @@ function AssistantMessageTimeline({
   content,
   streaming,
   toolSteps,
+  memoryHits,
   webSearchCardResultCount
 }: {
   content: string;
   streaming: boolean;
   toolSteps: ToolStep[];
+  memoryHits?: MemoryHitPayload;
   webSearchCardResultCount: number;
 }) {
   const parts = useMemo(() => buildAssistantTimelineParts(content, toolSteps), [content, toolSteps]);
-  const lastTextIndex = streaming ? parts.reduce((last, part, index) => (part.type === 'text' ? index : last), -1) : -1;
+  const lastPart = parts[parts.length - 1];
+  const lastTextIndex = streaming && lastPart?.type === 'text' ? parts.length - 1 : -1;
+  const showToolWaitingDot = streaming && lastPart?.type === 'tools' && lastPart.steps.every((step) => toolStepStatus(step).kind !== 'running');
+  const showFallbackThinkingDot = streaming && content.trim() && lastTextIndex === -1 && lastPart?.type !== 'tools';
+  const hasMemoryHits = !!memoryHits?.memories?.length;
 
-  if (streaming && !content.trim() && !toolSteps.length) {
+  if (streaming && !content.trim() && !toolSteps.length && !hasMemoryHits) {
     return <AssistantThinkingDot />;
   }
 
   return (
     <>
+      {/* {hasMemoryHits && <MemoryHitNotice hits={memoryHits} />} */}
       {parts.map((part, index) =>
         part.type === 'text' ? (
           <MarkdownContent content={part.content} streamingCursor={index === lastTextIndex} key={`text-${index}`} />
@@ -1276,9 +1908,58 @@ function AssistantMessageTimeline({
           <ToolTimeline steps={part.steps} webSearchCardResultCount={webSearchCardResultCount} key={`tools-${part.offset}-${index}`} />
         )
       )}
-      {streaming && content.trim() && lastTextIndex === -1 && <AssistantThinkingDot compact />}
+      {showToolWaitingDot && <AssistantThinkingDot compact />}
+      {streaming && !content.trim() && !toolSteps.length && hasMemoryHits && <AssistantThinkingDot compact />}
+      {showFallbackThinkingDot && <AssistantThinkingDot compact />}
     </>
   );
+}
+
+function MemoryHitNotice({ hits }: { hits: MemoryHitPayload }) {
+  const items = hits.memories.slice(0, 10);
+  const reranked = hits.method === 'vector_rerank';
+  return (
+    <section className="memory-hit-notice" aria-label="记忆检索命中">
+      <div className="memory-hit-notice__head">
+        <span className="memory-hit-notice__title">
+          <Sparkles size={14} strokeWidth={2.4} />
+          记忆检索命中
+        </span>
+        <span className="memory-hit-notice__meta">
+          {reranked ? '向量召回 + LLM 重排' : '仅向量召回'} · {hits.model || 'embedding'} · {hits.dim || '-'} 维 · {hits.memories.length} 条
+        </span>
+      </div>
+      <div className="memory-hit-notice__items">
+        {items.map((memory) => (
+          <div className="memory-hit-notice__item" key={memory.id}>
+            <div className="memory-hit-notice__row">
+              <span className="memory-hit-notice__content">{memory.content}</span>
+              <span className="memory-hit-notice__score">{formatMemoryScores(memory)}</span>
+            </div>
+            {reranked && memory.reason && <span className="memory-hit-notice__reason">{memory.reason}</span>}
+            <span className="memory-hit-notice__tags">
+              {memory.category && <span>{memory.category}</span>}
+              <span>{memory.embedding_status === 'ready' ? '向量就绪' : memoryStatusLabel(memory.embedding_status)}</span>
+            </span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function formatMemoryScores(memory: MemoryHit) {
+  const vector = Number.isFinite(memory.vector_score) ? memory.vector_score : memory.score;
+  const parts = [`向量 ${formatScore(vector)}`];
+  if (typeof memory.rerank_score === 'number' && Number.isFinite(memory.rerank_score)) {
+    parts.push(`重排 ${formatScore(memory.rerank_score)}`);
+  }
+  return parts.join(' · ');
+}
+
+function formatScore(score: number) {
+  if (!Number.isFinite(score)) return '-';
+  return score.toFixed(3);
 }
 
 function AssistantThinkingDot({ compact = false }: { compact?: boolean }) {
@@ -1301,6 +1982,9 @@ function ToolTimeline({ steps, webSearchCardResultCount }: { steps: ToolStep[]; 
         if (step.name === 'web_search') {
           return <WebSearchToolCard key={key} step={step} status={status} resultCount={webSearchCardResultCount} />;
         }
+        if (step.name === 'image_generate' || step.name === 'image_edit') {
+          return <ImageToolCard key={key} step={step} status={status} />;
+        }
         return (
           <section className={'tool-card tool-card--' + status.kind} key={key}>
             <div className="tool-card__head" title={toolStepSummary(step)}>
@@ -1321,6 +2005,62 @@ function ToolTimeline({ steps, webSearchCardResultCount }: { steps: ToolStep[]; 
       })}
     </div>
   );
+}
+
+function ImageToolCard({ step, status }: { step: ToolStep; status: { kind: string; label: string } }) {
+  const [now, setNow] = useState(() => Date.now());
+  const output = parseImageToolOutput(step.output);
+  const images = output?.images?.map(imageToolSource).filter(Boolean) as string[] || [];
+  const title = step.name === 'image_edit' ? '图片编辑' : '图片生成';
+  const runningText = step.name === 'image_edit' ? '正在编辑图片' : '正在生成图片';
+  const error = output?.error || (status.kind === 'error' ? '图片工具调用失败' : '');
+  useEffect(() => {
+    if (status.kind !== 'running') return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [status.kind, step.call_id]);
+  const showSlowHint = status.kind === 'running' && isStepOlderThan(step, 30_000, now);
+  return (
+    <section className={'image-tool-card image-tool-card--' + status.kind} title={toolStepSummary(step)}>
+      <div className="image-tool-card__head">
+        <span>{status.kind === 'running' ? runningText : title}</span>
+        <small>{status.label}</small>
+      </div>
+      {status.kind === 'running' ? (
+        <>
+          <div className="image-tool-card__loading" aria-hidden="true">
+            <span className="image-tool-card__spinner" />
+          </div>
+          {showSlowHint && <div className="image-tool-card__hint">当前生图较慢，请耐心等待</div>}
+        </>
+      ) : error ? (
+        <div className="image-tool-card__error">{error}</div>
+      ) : images.length ? (
+        <div className="image-tool-card__grid">
+          {images.map((src, index) => (
+            <a href={src} target="_blank" rel="noreferrer" key={`${src}-${index}`}>
+              <img src={src} alt="" loading="lazy" referrerPolicy="no-referrer" />
+            </a>
+          ))}
+        </div>
+      ) : (
+        <div className="image-tool-card__error">没有返回图片</div>
+      )}
+    </section>
+  );
+}
+
+function isStepOlderThan(step: ToolStep, thresholdMs: number, now = Date.now()) {
+  if (!step.timestamp) return false;
+  const startedAt = Date.parse(step.timestamp);
+  if (!Number.isFinite(startedAt)) return false;
+  return now - startedAt >= thresholdMs;
+}
+
+function imageToolSource(item: { url?: string; b64_json?: string }) {
+  if (item.url) return item.url;
+  if (item.b64_json) return item.b64_json.startsWith('data:') ? item.b64_json : `data:image/png;base64,${item.b64_json}`;
+  return '';
 }
 
 function WebSearchToolCard({ step, status, resultCount }: { step: ToolStep; status: { kind: string; label: string }; resultCount: number }) {
@@ -1414,6 +2154,84 @@ function parseToolSteps(metadata: string): ToolStep[] {
   } catch {
     return [];
   }
+}
+
+function parseMemoryHits(metadata: string): MemoryHitPayload | undefined {
+  if (!metadata) return undefined;
+  try {
+    const parsed = JSON.parse(metadata) as { memory_hits?: unknown };
+    return normalizeMemoryHitPayload(parsed.memory_hits) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseImageToolOutput(value?: string): ImageToolOutput | null {
+  const parsed = parseJSONValue(value);
+  if (!parsed || typeof parsed !== 'object') return null;
+  const item = parsed as Record<string, unknown>;
+  const rawImages = Array.isArray(item.images) ? item.images : [];
+  const images = rawImages
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const image = entry as Record<string, unknown>;
+      const url = typeof image.url === 'string' ? image.url : '';
+      const b64 = typeof image.b64_json === 'string' ? image.b64_json : '';
+      if (!url && !b64) return null;
+      return { url, b64_json: b64 };
+    })
+    .filter((entry): entry is { url: string; b64_json: string } => !!entry);
+  return {
+    ok: typeof item.ok === 'boolean' ? item.ok : undefined,
+    tool: typeof item.tool === 'string' ? item.tool : undefined,
+    created: typeof item.created === 'number' ? item.created : undefined,
+    images,
+    error: typeof item.error === 'string' ? item.error : undefined
+  };
+}
+
+function normalizeMemoryHitPayload(value: unknown): MemoryHitPayload | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  const rawMemories = Array.isArray(item.memories) ? item.memories : [];
+  const memories = rawMemories
+    .map((entry) => normalizeMemoryHit(entry))
+    .filter((entry): entry is MemoryHit => !!entry);
+  if (!memories.length) return null;
+  return {
+    method: typeof item.method === 'string' ? item.method : 'vector',
+    model: typeof item.model === 'string' ? item.model : '',
+    dim: typeof item.dim === 'number' ? item.dim : 0,
+    memories
+  };
+}
+
+function normalizeMemoryHit(value: unknown): MemoryHit | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  const id = typeof item.id === 'number' ? item.id : 0;
+  const content = typeof item.content === 'string' ? item.content.trim() : '';
+  if (!id || !content) return null;
+  return {
+    id,
+    user_id: typeof item.user_id === 'number' ? item.user_id : 0,
+    content,
+    source: typeof item.source === 'string' ? item.source : '',
+    category: typeof item.category === 'string' ? item.category : '',
+    origin: typeof item.origin === 'string' ? item.origin : '',
+    tokens: typeof item.tokens === 'number' ? item.tokens : 0,
+    enabled: typeof item.enabled === 'boolean' ? item.enabled : true,
+    embedding_model: typeof item.embedding_model === 'string' ? item.embedding_model : '',
+    embedding_dim: typeof item.embedding_dim === 'number' ? item.embedding_dim : 0,
+    embedding_updated_at: typeof item.embedding_updated_at === 'string' ? item.embedding_updated_at : '',
+    embedding_status: item.embedding_status === 'disabled' || item.embedding_status === 'pending' || item.embedding_status === 'stale' ? item.embedding_status : 'ready',
+    score: typeof item.score === 'number' ? item.score : 0,
+    vector_score: typeof item.vector_score === 'number' ? item.vector_score : typeof item.score === 'number' ? item.score : 0,
+    rerank_score: typeof item.rerank_score === 'number' ? item.rerank_score : undefined,
+    reason: typeof item.reason === 'string' ? item.reason : undefined,
+    created_at: typeof item.created_at === 'string' ? item.created_at : '',
+    updated_at: typeof item.updated_at === 'string' ? item.updated_at : ''
+  };
 }
 
 function normalizeToolStep(value: unknown): ToolStep | null {
@@ -1519,6 +2337,16 @@ function toolStepSummary(step: ToolStep) {
     if (query) return `联网搜索 ${query}`;
     return '准备联网搜索';
   }
+  if (step.name === 'image_generate') {
+    const prompt = jsonStringField(args, 'prompt');
+    if (prompt) return `生成图片：${prompt}`;
+    return '准备生成图片';
+  }
+  if (step.name === 'image_edit') {
+    const prompt = jsonStringField(args, 'prompt');
+    if (prompt) return `编辑图片：${prompt}`;
+    return '准备编辑图片';
+  }
   if (toolStepStatus(step).kind === 'running') return '正在执行';
   return '工具结果已返回';
 }
@@ -1586,9 +2414,16 @@ function MessageAttachments({ attachments }: { attachments: string }) {
   return (
     <div className="message-attachments">
       {items.map((attachment, index) => (
-        <span className="message-attachment" key={`${attachment.name}-${index}`}>
-          {attachment.name}
-        </span>
+        attachment.url || attachment.preview || (attachment.type || '').startsWith('image/') ? (
+          <a className="message-attachment message-attachment--image" href={attachment.url || attachment.preview || attachment.content} target="_blank" rel="noreferrer" key={`${attachment.name}-${index}`}>
+            <img src={attachment.url || attachment.preview || attachment.content} alt="" />
+            <span>{attachment.name}</span>
+          </a>
+        ) : (
+          <span className="message-attachment" key={`${attachment.name}-${index}`}>
+            {attachment.name}
+          </span>
+        )
       ))}
     </div>
   );
@@ -1611,6 +2446,9 @@ async function readAttachmentFile(file: File): Promise<ComposerAttachment> {
     type: file.type || 'application/octet-stream',
     size: file.size
   };
+  if ((file.type || '').startsWith('image/')) {
+    return readImageAttachmentFile(file, base);
+  }
   if (file.size > MAX_ATTACHMENT_BYTES) {
     return { ...base, error: '文件超过 512KB，未读取内容' };
   }
@@ -1620,6 +2458,77 @@ async function readAttachmentFile(file: File): Promise<ComposerAttachment> {
   } catch {
     return { ...base, error: '暂不支持读取此文件内容' };
   }
+}
+
+async function readImageAttachmentFile(file: File, base: { id: string; name: string; type: string; size: number }): Promise<ComposerAttachment> {
+  try {
+    const processed = await processImageForTool(file);
+    return {
+      ...base,
+      name: processed.name,
+      type: 'image/png',
+      size: processed.size,
+      content: processed.dataUrl,
+      preview: processed.dataUrl,
+      width: processed.width,
+      height: processed.height,
+      original_name: file.name,
+      original_type: file.type || 'application/octet-stream',
+      original_size: file.size
+    };
+  } catch (err) {
+    return { ...base, error: err instanceof Error ? err.message : '图片处理失败' };
+  }
+}
+
+async function processImageForTool(file: File) {
+  const bitmap = await createImageBitmap(file);
+  try {
+    let side = Math.max(bitmap.width, bitmap.height);
+    side = Math.max(16, Math.min(side, IMAGE_ATTACHMENT_TARGET_SIZE));
+    side = Math.floor(side / 16) * 16 || 16;
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const canvas = document.createElement('canvas');
+      canvas.width = side;
+      canvas.height = side;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('无法处理图片');
+      ctx.clearRect(0, 0, side, side);
+      const scale = Math.min(side / bitmap.width, side / bitmap.height);
+      const width = Math.max(1, Math.round(bitmap.width * scale));
+      const height = Math.max(1, Math.round(bitmap.height * scale));
+      const left = Math.floor((side - width) / 2);
+      const top = Math.floor((side - height) / 2);
+      ctx.drawImage(bitmap, left, top, width, height);
+      const dataUrl = canvas.toDataURL('image/png');
+      const size = dataURLByteLength(dataUrl);
+      if (size <= MAX_IMAGE_ATTACHMENT_BYTES || side <= 256) {
+        return {
+          name: pngFileName(file.name),
+          dataUrl,
+          size,
+          width: side,
+          height: side
+        };
+      }
+      side = Math.max(256, Math.floor((side * 0.82) / 16) * 16);
+    }
+    throw new Error('图片超过 4MB，压缩失败');
+  } finally {
+    bitmap.close();
+  }
+}
+
+function dataURLByteLength(dataUrl: string) {
+  const comma = dataUrl.indexOf(',');
+  const b64 = comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl;
+  const padding = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+}
+
+function pngFileName(name: string) {
+  const trimmed = name.trim() || 'image';
+  return trimmed.replace(/\.[^.]+$/, '') + '.png';
 }
 
 function toAttachmentPayload(attachment: ComposerAttachment): AttachmentPayload {
@@ -1661,10 +2570,22 @@ async function copyText(text: string) {
   }
 }
 
-function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+function Modal({
+  title,
+  onClose,
+  children,
+  className = '',
+  backdropClassName = ''
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+  className?: string;
+  backdropClassName?: string;
+}) {
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-      <section className="modal-card" role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
+    <div className={'modal-backdrop ' + backdropClassName} role="presentation" onMouseDown={onClose}>
+      <section className={'modal-card ' + className} role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
         <header className="modal-head">
           <h2>{title}</h2>
           <button className="modal-close" type="button" onClick={onClose} aria-label="关闭">
@@ -1677,34 +2598,179 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
   );
 }
 
-function MemoryPanel({ memories, onAdd }: { memories: Memory[]; onAdd: (content: string) => Promise<void> | void }) {
-  const [draft, setDraft] = useState('');
-
-  async function submit(event: React.FormEvent) {
-    event.preventDefault();
-    await onAdd(draft);
-    setDraft('');
-  }
-
+function ConfirmDialog({
+  dialog,
+  confirming,
+  onCancel,
+  onConfirm
+}: {
+  dialog: ConfirmDialogState;
+  confirming: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const danger = dialog.tone === 'danger';
   return (
-    <div className="side-panel">
-      <form className="inline-form" onSubmit={submit}>
-        <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="添加一条记忆" />
-        <button type="submit">
-          <Plus size={16} />
-          添加
-        </button>
-      </form>
+    <div className="confirm-backdrop" role="presentation" onMouseDown={onCancel}>
+      <section className="confirm-card" role="dialog" aria-modal="true" aria-label={dialog.title} onMouseDown={(event) => event.stopPropagation()}>
+        <div className={'confirm-icon ' + (danger ? 'is-danger' : '')}>
+          {danger ? <Trash2 size={20} strokeWidth={2.2} /> : <CircleCheck size={20} strokeWidth={2.2} />}
+        </div>
+        <div className="confirm-copy">
+          <h2>{dialog.title}</h2>
+          <p>{dialog.message}</p>
+        </div>
+        <div className="confirm-actions">
+          <button className="confirm-btn" type="button" onClick={onCancel} disabled={confirming}>
+            取消
+          </button>
+          <button className={'confirm-btn confirm-btn--primary ' + (danger ? 'is-danger' : '')} type="button" onClick={onConfirm} disabled={confirming}>
+            {confirming ? '处理中...' : dialog.confirmLabel || '确认'}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function MemoryPanel({
+  memories,
+  onToggle,
+  onDelete
+}: {
+  memories: Memory[];
+  onToggle: (memory: Memory) => void;
+  onDelete: (memory: Memory) => void;
+}) {
+  return (
+    <div className="side-panel memory-panel">
+      <div className="memory-note">
+        <strong>自动长期记忆</strong>
+        <span>系统会在回复完成后自动提炼稳定偏好和事实。这里可以查看、停用或删除。</span>
+      </div>
       <div className="memory-list">
         {memories.map((memory) => (
-          <div className="memory-card" key={memory.id}>
-            {memory.content}
+          <div className={'memory-card ' + (!memory.enabled ? 'is-disabled' : '')} key={memory.id}>
+            <div className="memory-card__badges">
+              <span>{memory.source === 'auto' ? '自动' : memory.source}</span>
+              {memory.category && <span>{memory.category}</span>}
+              <span>{memoryStatusLabel(memory.embedding_status)}</span>
+            </div>
+            <p>{memory.content}</p>
+            <div className="memory-card__footer">
+              <small>更新于 {memory.updated_at || '-'}</small>
+              <div>
+                <button className="text-btn" type="button" onClick={() => onToggle(memory)}>
+                  {memory.enabled ? '停用' : '启用'}
+                </button>
+                <button className="text-btn danger" type="button" onClick={() => onDelete(memory)}>
+                  删除
+                </button>
+              </div>
+            </div>
           </div>
         ))}
         {!memories.length && <div className="empty-hint">暂无记忆</div>}
       </div>
     </div>
   );
+}
+
+function memoryStatusLabel(status: Memory['embedding_status']) {
+  switch (status) {
+    case 'ready':
+      return '向量就绪';
+    case 'pending':
+      return '待向量';
+    case 'stale':
+      return '需重算';
+    default:
+      return '未启用向量';
+  }
+}
+
+function streamingAssistantIDs(active: ActiveStream | null, fallbackID: number) {
+  const ids = new Set<number>([fallbackID]);
+  if (active?.localAssistantID) ids.add(active.localAssistantID);
+  if (active?.assistantMessageID) ids.add(active.assistantMessageID);
+  return ids;
+}
+
+function bindStreamingAssistantMessage(items: Message[], localAssistantID: number, assistant: Message) {
+  const local = items.find((message) => message.id === localAssistantID);
+  const existing = items.find((message) => message.id === assistant.id);
+  const merged = {
+    ...assistant,
+    content: local?.content || existing?.content || assistant.content,
+    status: local?.status === 'streaming' ? 'streaming' : assistant.status
+  };
+  if (existing) {
+    return items
+      .filter((message) => message.id !== localAssistantID)
+      .map((message) => (message.id === assistant.id ? { ...message, ...merged } : message));
+  }
+  return items.map((message) => (message.id === localAssistantID ? { ...message, ...merged } : message));
+}
+
+function mergeStreamingRefreshMessages(currentItems: Message[], refreshedItems: Message[], active: ActiveStream) {
+  const live = currentItems.find((message) => message.id === active.assistantMessageID || message.id === active.localAssistantID);
+  if (!live) return refreshedItems;
+  return refreshedItems.map((message) =>
+    message.id === active.assistantMessageID && message.status === 'streaming'
+      ? { ...message, content: live.content || message.content, status: live.status || message.status }
+      : message
+  );
+}
+
+function mergeRecoveredStreamingMessages(
+  currentItems: Message[],
+  refreshedItems: Message[],
+  targetContentForMessage: (messageID: number) => string | undefined
+) {
+  const patches: RecoveredStreamPatch[] = [];
+  const currentByID = new Map(currentItems.map((message) => [message.id, message]));
+  const messages = refreshedItems.map((message) => {
+    if (message.role !== 'assistant') return message;
+    const current = currentByID.get(message.id);
+    if (!current) return message;
+    const visibleContent = current.content || '';
+    const targetContent = targetContentForMessage(message.id) || visibleContent;
+    const incomingContent = message.content || '';
+    if (targetContent.length > visibleContent.length && incomingContent.startsWith(targetContent)) {
+      return { ...message, content: visibleContent, status: 'streaming' };
+    }
+    const baseContent = incomingContent.startsWith(targetContent) ? targetContent : visibleContent;
+    if (incomingContent.length > baseContent.length && incomingContent.startsWith(baseContent)) {
+      patches.push({
+        messageID: message.id,
+        text: incomingContent.slice(baseContent.length),
+        finalMessage: message.status === 'streaming' ? undefined : message
+      });
+      return { ...message, content: visibleContent, status: 'streaming' };
+    }
+    if (message.status !== 'streaming' && targetContentForMessage(message.id)) {
+      patches.push({ messageID: message.id, text: '', finalMessage: message });
+      return { ...message, content: visibleContent, status: 'streaming' };
+    }
+    return message;
+  });
+  return { messages, patches };
+}
+
+function recoveredStreamChunkRunes(remaining: number) {
+  if (remaining > 80) return 4;
+  if (remaining > 30) return 3;
+  return 1;
+}
+
+function friendlyStreamErrorMessage(err: unknown) {
+  if (err instanceof DOMException && err.name === 'AbortError') return '';
+  const message = err instanceof Error ? err.message : '';
+  if (!message) return '连接中断，正在同步会话';
+  if (/network|failed to fetch|load failed|cancelled|canceled|terminated|connection/i.test(message)) {
+    return '连接中断，正在同步会话';
+  }
+  return message;
 }
 
 function AdminApp() {
@@ -1757,7 +2823,7 @@ function ForbiddenScreen() {
 function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [adminSettings, setAdminSettings] = useState<AdminSettings>(emptyAdminSettings);
-  const [activeTab, setActiveTab] = useState<'providers' | 'unifuncs' | 'usage'>('providers');
+  const [activeTab, setActiveTab] = useState<AdminTab>('overview');
 
   async function refreshProviders() {
     const res = await api.providers();
@@ -1775,7 +2841,25 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
       searching_base_url: settings.searching_base_url?.value || '',
       searching_api_key: settings.searching_api_key?.value || '',
       searching_model: settings.searching_model?.value || '',
-      searching_api_id: settings.searching_api_id?.value || ''
+      searching_api_id: settings.searching_api_id?.value || '',
+      image_tool_mode: settings.image_tool_mode?.value || 'image_api',
+      image_tool_base_url: settings.image_tool_base_url?.value || 'https://api.tu-zi.com',
+      image_tool_api_key: settings.image_tool_api_key?.value || '',
+      image_generate_model: settings.image_generate_model?.value || 'gpt-image-2',
+      image_edit_model: settings.image_edit_model?.value || 'gpt-image-1.5',
+      image_responses_model: settings.image_responses_model?.value || 'gpt-5.5',
+      image_chat_model: settings.image_chat_model?.value || 'gpt-4o-image',
+      image_default_size: settings.image_default_size?.value || '1024x1024',
+      image_edit_size: settings.image_edit_size?.value || '1:1',
+      image_default_quality: settings.image_default_quality?.value || 'auto',
+      image_response_format: settings.image_response_format?.value || 'url',
+      title_provider_id: settings.title_provider_id?.value || '0',
+      memory_provider_id: settings.memory_provider_id?.value || '0',
+      embedding_provider_id: settings.embedding_provider_id?.value || '0',
+      memory_recent_message_limit: settings.memory_recent_message_limit?.value || '12',
+      memory_max_actions_per_run: settings.memory_max_actions_per_run?.value || '5',
+      memory_inject_limit: settings.memory_inject_limit?.value || '20',
+      embedding_top_k: settings.embedding_top_k?.value || '8'
     });
   }
 
@@ -1800,28 +2884,42 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
             退出
           </button>
         </div>
-        <button className={'admin-nav-item ' + (activeTab === 'providers' ? 'active' : '')} type="button" onClick={() => setActiveTab('providers')}>
-          <Settings size={16} />
-          LLM 配置
-        </button>
-        <button className={'admin-nav-item ' + (activeTab === 'unifuncs' ? 'active' : '')} type="button" onClick={() => setActiveTab('unifuncs')}>
-          <Search size={16} />
-          搜索工具
-        </button>
-        <button className={'admin-nav-item ' + (activeTab === 'usage' ? 'active' : '')} type="button" onClick={() => setActiveTab('usage')}>
-          <Archive size={16} />
-          使用情况
-        </button>
+        <nav className="admin-nav" aria-label="后台分类">
+          <button className={'admin-nav-item ' + (activeTab === 'overview' ? 'active' : '')} type="button" onClick={() => setActiveTab('overview')}>
+            <LayoutDashboard size={16} />
+            概览
+          </button>
+          <button className={'admin-nav-item ' + (activeTab === 'models' ? 'active' : '')} type="button" onClick={() => setActiveTab('models')}>
+            <Settings size={16} />
+            模型
+          </button>
+          <button className={'admin-nav-item ' + (activeTab === 'tools' ? 'active' : '')} type="button" onClick={() => setActiveTab('tools')}>
+            <Wrench size={16} />
+            工具
+          </button>
+          <button className={'admin-nav-item ' + (activeTab === 'memory' ? 'active' : '')} type="button" onClick={() => setActiveTab('memory')}>
+            <BookMarked size={16} />
+            记忆
+          </button>
+          <button className={'admin-nav-item ' + (activeTab === 'runtime' ? 'active' : '')} type="button" onClick={() => setActiveTab('runtime')}>
+            <Activity size={16} />
+            运行
+          </button>
+        </nav>
       </aside>
       <section className="admin-main">
         <header className="admin-header">
           <h1>后台管理</h1>
           <p>/admin</p>
         </header>
-        {activeTab === 'providers' ? (
-          <ProviderPanel providers={providers} onChanged={refreshProviders} />
-        ) : activeTab === 'unifuncs' ? (
+        {activeTab === 'overview' ? (
+          <OverviewPanel providers={providers} settings={adminSettings} onNavigate={setActiveTab} />
+        ) : activeTab === 'models' ? (
+          <ProviderPanel providers={providers} settings={adminSettings} onSettingsChanged={refreshSettings} onChanged={refreshProviders} />
+        ) : activeTab === 'tools' ? (
           <UniFuncsPanel settings={adminSettings} onChanged={refreshSettings} />
+        ) : activeTab === 'memory' ? (
+          <MemorySettingsPanel providers={providers} settings={adminSettings} onChanged={refreshSettings} />
         ) : (
           <UsagePanel />
         )}
@@ -1830,11 +2928,106 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
   );
 }
 
+function OverviewPanel({ providers, settings, onNavigate }: { providers: Provider[]; settings: AdminSettings; onNavigate: (tab: AdminTab) => void }) {
+  const activeProviders = providers.filter((provider) => provider.is_active);
+  const visibleProviders = providers.filter((provider) => provider.is_visible);
+  const defaultProvider = providers.find((provider) => provider.is_default);
+  const titleProvider = providers.find((provider) => String(provider.id) === settings.title_provider_id);
+  const memoryProvider = providers.find((provider) => String(provider.id) === settings.memory_provider_id);
+  const embeddingProvider = providers.find((provider) => String(provider.id) === settings.embedding_provider_id);
+  const toolMode = settings.search_tool_mode === 'searching' ? 'Searching LLM' : 'UniFuncs';
+
+  return (
+    <div className="admin-panel">
+      <section className="admin-section-card admin-overview-hero">
+        <div className="provider-form-head">
+          <div>
+            <h2>系统概览</h2>
+            <p>快速确认模型、工具、记忆和运行模块是否已经处在可用状态。</p>
+          </div>
+        </div>
+        <div className="admin-status-grid">
+          <button className="admin-status-card" type="button" onClick={() => onNavigate('models')}>
+            <span>模型</span>
+            <strong>{activeProviders.length ? `${activeProviders.length} 个启用` : '未启用'}</strong>
+            <small>{visibleProviders.length ? `${visibleProviders.length} 个前台可见` : '暂无前台可见模型'}</small>
+          </button>
+          <button className="admin-status-card" type="button" onClick={() => onNavigate('tools')}>
+            <span>工具</span>
+            <strong>{toolMode}</strong>
+            <small>{settings.search_tool_mode === 'searching' ? '当前使用 searching 工具' : '当前使用 web_search / web_reader'}</small>
+          </button>
+          <button className="admin-status-card" type="button" onClick={() => onNavigate('memory')}>
+            <span>记忆</span>
+            <strong>{memoryProvider && embeddingProvider ? '可用' : '未完整配置'}</strong>
+            <small>{memoryProvider ? `LLM ${memoryProvider.name}` : '未配置记忆 LLM'}</small>
+          </button>
+          <button className="admin-status-card" type="button" onClick={() => onNavigate('runtime')}>
+            <span>运行</span>
+            <strong>待接入</strong>
+            <small>后续放统计、日志、成本和错误率</small>
+          </button>
+        </div>
+      </section>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>关键配置</h2>
+            <p>这里展示当前会直接影响前台对话体验的配置。</p>
+          </div>
+        </div>
+        <div className="admin-summary-list">
+          <div>
+            <span>默认模型</span>
+            <strong>{defaultProvider ? `${defaultProvider.name} · ${defaultProvider.model}` : '未设置'}</strong>
+          </div>
+          <div>
+            <span>对话标题 LLM</span>
+            <strong>{titleProvider ? `${titleProvider.name} · ${titleProvider.model}` : '复用记忆 LLM'}</strong>
+          </div>
+          <div>
+            <span>Embedding Provider</span>
+            <strong>{embeddingProvider ? `${embeddingProvider.name} · ${embeddingProvider.model}` : '未配置'}</strong>
+          </div>
+          <div>
+            <span>搜索卡片条数</span>
+            <strong>{settings.web_search_card_result_count || '4'} 条</strong>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function UsagePanel() {
   return (
     <div className="admin-panel">
-      <h2>使用情况</h2>
-      <p>这里以后可以放调用量、成本、错误率等统计。</p>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>运行情况</h2>
+            <p>这里以后可以放调用量、成本、错误率、请求日志等统计。</p>
+          </div>
+        </div>
+        <div className="admin-placeholder-grid">
+          <div>
+            <strong>调用量</strong>
+            <span>待接入</span>
+          </div>
+          <div>
+            <strong>成本</strong>
+            <span>待接入</span>
+          </div>
+          <div>
+            <strong>错误率</strong>
+            <span>待接入</span>
+          </div>
+          <div>
+            <strong>请求日志</strong>
+            <span>待接入</span>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1869,27 +3062,45 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
     }
   }
 
+  async function copySearchingToImageTool() {
+    const nextForm = {
+      ...form,
+      image_tool_base_url: form.searching_base_url,
+      image_tool_api_key: form.searching_api_key
+    };
+    await saveForm(nextForm);
+  }
+
   const mode = form.search_tool_mode === 'searching' ? 'searching' : 'unifuncs';
+  const imageMode = form.image_tool_mode === 'responses' || form.image_tool_mode === 'chat_completions' ? form.image_tool_mode : 'image_api';
 
   return (
     <div className="admin-panel">
-      <div className="tool-mode-switch" role="group" aria-label="搜索工具模式">
-        <button
-          className={'tool-mode-switch__item ' + (mode === 'unifuncs' ? 'active' : '')}
-          type="button"
-          onClick={() => void saveForm({ ...form, search_tool_mode: 'unifuncs' })}
-        >
-          UniFuncs 联动
-        </button>
-        <button
-          className={'tool-mode-switch__item ' + (mode === 'searching' ? 'active' : '')}
-          type="button"
-          onClick={() => void saveForm({ ...form, search_tool_mode: 'searching' })}
-        >
-          Searching LLM
-        </button>
-      </div>
-      <form className="settings-grid" onSubmit={save}>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>工具模式</h2>
+            <p>选择前台对话可以调用的搜索工具类型。</p>
+          </div>
+        </div>
+        <div className="tool-mode-switch" role="group" aria-label="搜索工具模式">
+          <button
+            className={'tool-mode-switch__item ' + (mode === 'unifuncs' ? 'active' : '')}
+            type="button"
+            onClick={() => void saveForm({ ...form, search_tool_mode: 'unifuncs' })}
+          >
+            UniFuncs 联动
+          </button>
+          <button
+            className={'tool-mode-switch__item ' + (mode === 'searching' ? 'active' : '')}
+            type="button"
+            onClick={() => void saveForm({ ...form, search_tool_mode: 'searching' })}
+          >
+            Searching LLM
+          </button>
+        </div>
+      </section>
+      <form className="settings-grid admin-section-card" onSubmit={save}>
         <div className="provider-form-head">
           <div>
             <h2>{mode === 'unifuncs' ? 'UniFuncs Web Search + Web Reader' : 'Searching LLM API'}</h2>
@@ -1958,16 +3169,261 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
           </button>
         </div>
       </form>
+      <form className="settings-grid admin-section-card" onSubmit={save}>
+        <div className="provider-form-head">
+          <div>
+            <h2>图片工具</h2>
+            <p>配置主 LLM 可调用的 image_generate 和 image_edit。</p>
+          </div>
+          <button className="text-btn" type="button" onClick={() => void copySearchingToImageTool()}>
+            复制 Searching 配置
+          </button>
+        </div>
+        <div className="tool-mode-switch" role="group" aria-label="图片工具模式">
+          <button
+            className={'tool-mode-switch__item ' + (imageMode === 'image_api' ? 'active' : '')}
+            type="button"
+            onClick={() => setForm({ ...form, image_tool_mode: 'image_api' })}
+          >
+            Image API
+          </button>
+          <button
+            className={'tool-mode-switch__item ' + (imageMode === 'responses' ? 'active' : '')}
+            type="button"
+            onClick={() => setForm({ ...form, image_tool_mode: 'responses' })}
+          >
+            Responses
+          </button>
+          <button
+            className={'tool-mode-switch__item ' + (imageMode === 'chat_completions' ? 'active' : '')}
+            type="button"
+            onClick={() => setForm({ ...form, image_tool_mode: 'chat_completions' })}
+          >
+            Chat Completions
+          </button>
+        </div>
+        <input
+          placeholder="图片工具 Base URL，例如 https://api.tu-zi.com"
+          value={form.image_tool_base_url}
+          onChange={(event) => setForm({ ...form, image_tool_base_url: event.target.value })}
+        />
+        <input
+          placeholder="图片工具 API Key"
+          value={form.image_tool_api_key}
+          onChange={(event) => setForm({ ...form, image_tool_api_key: event.target.value })}
+        />
+        {imageMode === 'image_api' && (
+          <div className="admin-field-grid">
+            <label className="field-block">
+              生图模型
+              <select value={form.image_generate_model} onChange={(event) => setForm({ ...form, image_generate_model: event.target.value })}>
+                <option value="gpt-image-2">gpt-image-2</option>
+                <option value="gpt-image-1.5">gpt-image-1.5</option>
+                <option value="gpt-image-1">gpt-image-1</option>
+                <option value="gpt-4o-image-vip">gpt-4o-image-vip</option>
+                <option value="gpt-4o-image">gpt-4o-image</option>
+              </select>
+            </label>
+            <label className="field-block">
+              编辑模型
+              <select value={form.image_edit_model} onChange={(event) => setForm({ ...form, image_edit_model: event.target.value })}>
+                <option value="gpt-image-1.5">gpt-image-1.5</option>
+                <option value="gpt-image-2">gpt-image-2</option>
+                <option value="gpt-image-1">gpt-image-1</option>
+                <option value="gpt-4o-image-vip">gpt-4o-image-vip</option>
+                <option value="gpt-4o-image">gpt-4o-image</option>
+              </select>
+            </label>
+          </div>
+        )}
+        {imageMode === 'responses' && (
+          <label className="field-block">
+            Responses 模型
+            <input value={form.image_responses_model} onChange={(event) => setForm({ ...form, image_responses_model: event.target.value })} />
+          </label>
+        )}
+        {imageMode === 'chat_completions' && (
+          <label className="field-block">
+            Chat Completions 模型
+            <input value={form.image_chat_model} onChange={(event) => setForm({ ...form, image_chat_model: event.target.value })} />
+          </label>
+        )}
+        <div className="admin-field-grid">
+          <label className="field-block">
+            生图默认尺寸
+            <input value={form.image_default_size} onChange={(event) => setForm({ ...form, image_default_size: event.target.value })} />
+          </label>
+          <label className="field-block">
+            编辑默认尺寸
+            <select value={form.image_edit_size} onChange={(event) => setForm({ ...form, image_edit_size: event.target.value })}>
+              <option value="1:1">1:1</option>
+              <option value="2:3">2:3</option>
+              <option value="3:2">3:2</option>
+            </select>
+          </label>
+        </div>
+        <div className="admin-field-grid">
+          <label className="field-block">
+            默认质量
+            <select value={form.image_default_quality} onChange={(event) => setForm({ ...form, image_default_quality: event.target.value })}>
+              <option value="auto">auto</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+          <label className="field-block">
+            返回格式
+            <select value={form.image_response_format} onChange={(event) => setForm({ ...form, image_response_format: event.target.value })}>
+              <option value="url">url</option>
+              <option value="b64_json">b64_json</option>
+            </select>
+          </label>
+        </div>
+        <p className="field-help">复制 Searching 配置只是把已有 URL/Key 抄到图片工具配置里用于测试；image_generate 和 image_edit 仍然调用独立图片接口。</p>
+        {error && <div className="error-line">{error}</div>}
+        <div className="provider-form-actions">
+          <button className="primary-btn" type="submit">
+            保存图片工具配置
+          </button>
+        </div>
+      </form>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>后续工具能力</h2>
+            <p>后续新增的外部 API 工具、插件工具和能力开关都放在这里统一管理。</p>
+          </div>
+        </div>
+        <div className="provider-badges">
+          <span>web_search</span>
+          <span>web_reader</span>
+          <span>searching</span>
+          <span>image_generate</span>
+          <span>image_edit</span>
+        </div>
+      </section>
     </div>
   );
 }
 
-function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChanged: () => Promise<void> | void }) {
+function MemorySettingsPanel({
+  providers,
+  settings,
+  onChanged
+}: {
+  providers: Provider[];
+  settings: AdminSettings;
+  onChanged: () => Promise<void> | void;
+}) {
+  const [form, setForm] = useState<AdminSettings>(settings);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    setForm(settings);
+  }, [settings]);
+
+  async function save(event: React.FormEvent) {
+    event.preventDefault();
+    setError('');
+    try {
+      await api.updateAdminSettings(form);
+      await onChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存失败');
+    }
+  }
+
+  return (
+    <div className="admin-panel">
+      <form className="settings-grid admin-section-card" onSubmit={save}>
+        <div className="provider-form-head">
+          <div>
+            <h2>自动长期记忆</h2>
+            <p>回复完成后由记忆模型自动判断新增、更新或忽略，并用 Embedding 模型检索相关记忆注入上下文。</p>
+          </div>
+        </div>
+        <label className="field-block">
+          记忆 LLM
+          <select value={form.memory_provider_id} onChange={(event) => setForm({ ...form, memory_provider_id: event.target.value })}>
+            <option value="0">未配置</option>
+            {providers.map((provider) => (
+              <option value={String(provider.id)} key={provider.id}>
+                {provider.name} · {provider.model}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="field-block">
+          Embedding Provider
+          <select value={form.embedding_provider_id} onChange={(event) => setForm({ ...form, embedding_provider_id: event.target.value })}>
+            <option value="0">未配置</option>
+            {providers.map((provider) => (
+              <option value={String(provider.id)} key={provider.id}>
+                {provider.name} · {provider.model}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="admin-form-divider" />
+        <div className="provider-form-head">
+          <div>
+            <h2>写入与检索限制</h2>
+            <p>控制记忆模型每次看多少上下文，以及单轮最多产生多少记忆动作。</p>
+          </div>
+        </div>
+        <label className="field-block">
+          记忆模型查看的最近消息数
+          <input value={form.memory_recent_message_limit} onChange={(event) => setForm({ ...form, memory_recent_message_limit: event.target.value })} />
+        </label>
+        <label className="field-block">
+          单轮最多记忆动作
+          <input value={form.memory_max_actions_per_run} onChange={(event) => setForm({ ...form, memory_max_actions_per_run: event.target.value })} />
+        </label>
+        <label className="field-block">
+          注入记忆上限
+          <input value={form.memory_inject_limit} onChange={(event) => setForm({ ...form, memory_inject_limit: event.target.value })} />
+        </label>
+        <label className="field-block">
+          Embedding 检索 Top K
+          <input value={form.embedding_top_k} onChange={(event) => setForm({ ...form, embedding_top_k: event.target.value })} />
+        </label>
+        <p className="field-help">用户提问时固定注入向量相似度最高的 10 条记忆；未配置记忆 LLM 时不会自动写入记忆，未配置 Embedding 时不会注入长期记忆。</p>
+        {error && <div className="error-line">{error}</div>}
+        <div className="provider-form-actions">
+          <button className="primary-btn" type="submit">
+            保存记忆配置
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ProviderPanel({
+  providers,
+  settings,
+  onSettingsChanged,
+  onChanged
+}: {
+  providers: Provider[];
+  settings: AdminSettings;
+  onSettingsChanged: () => Promise<void> | void;
+  onChanged: () => Promise<void> | void;
+}) {
   const [form, setForm] = useState<ProviderFormState>(emptyProviderForm);
+  const [settingsForm, setSettingsForm] = useState<AdminSettings>(settings);
   const [editingProviderId, setEditingProviderId] = useState<number | null>(null);
   const [error, setError] = useState('');
 
   const editingProvider = providers.find((provider) => provider.id === editingProviderId);
+  const defaultProvider = providers.find((provider) => provider.is_default);
+  const visibleProviderCount = providers.filter((provider) => provider.is_visible).length;
+  const activeProviderCount = providers.filter((provider) => provider.is_active).length;
+
+  useEffect(() => {
+    setSettingsForm(settings);
+  }, [settings]);
 
   function resetForm() {
     setForm(emptyProviderForm);
@@ -2026,9 +3482,62 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
     }
   }
 
+  async function saveTitleProvider(nextProviderID: string) {
+    const nextForm = { ...settingsForm, title_provider_id: nextProviderID };
+    setSettingsForm(nextForm);
+    setError('');
+    try {
+      await api.updateAdminSettings(nextForm);
+      await onSettingsChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存失败');
+    }
+  }
+
   return (
     <div className="admin-panel">
-      <form className="settings-grid" onSubmit={save}>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>模型状态</h2>
+            <p>这里汇总前台模型选择会直接使用到的 Provider 状态。</p>
+          </div>
+        </div>
+        <div className="admin-summary-list admin-summary-list--compact">
+          <div>
+            <span>默认模型</span>
+            <strong>{defaultProvider ? `${defaultProvider.name} · ${defaultProvider.model}` : '未设置'}</strong>
+          </div>
+          <div>
+            <span>前台可见</span>
+            <strong>{visibleProviderCount} 个</strong>
+          </div>
+          <div>
+            <span>启用模型</span>
+            <strong>{activeProviderCount} 个</strong>
+          </div>
+        </div>
+      </section>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>对话标题 LLM</h2>
+            <p>新对话发出第一条消息后，用这个模型根据用户第一条消息生成侧边栏标题；未选择时会复用记忆 LLM。</p>
+          </div>
+        </div>
+        <label className="field-block">
+          标题生成模型
+          <select value={settingsForm.title_provider_id} onChange={(event) => void saveTitleProvider(event.target.value)}>
+            <option value="0">未单独配置，复用记忆 LLM</option>
+            {providers.map((provider) => (
+              <option value={String(provider.id)} key={provider.id}>
+                {provider.name} · {provider.model}
+              </option>
+            ))}
+          </select>
+        </label>
+      </section>
+      <form className="settings-grid admin-section-card" onSubmit={save}>
         <div className="provider-form-head">
           <div>
             <h2>{editingProvider ? '编辑 LLM 配置' : '新增 LLM 配置'}</h2>
@@ -2095,7 +3604,14 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
           )}
         </div>
       </form>
-      <div className="provider-list">
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>Provider 列表</h2>
+            <p>给前台模型选择、标题生成、记忆和工具使用的模型提供方都在这里统一维护。</p>
+          </div>
+        </div>
+        <div className="provider-list">
         {providers.map((provider) => (
           <div className="provider-card" key={provider.id}>
             <div className="provider-card__head">
@@ -2125,7 +3641,8 @@ function ProviderPanel({ providers, onChanged }: { providers: Provider[]; onChan
           </div>
         ))}
         {!providers.length && <div className="empty-hint">暂无 Provider</div>}
-      </div>
+        </div>
+      </section>
     </div>
   );
 }

@@ -25,6 +25,7 @@ export type Provider = {
 
 export type Conversation = {
   id: number;
+  session_id: string;
   user_id: number;
   title: string;
   system_prompt: string;
@@ -62,13 +63,43 @@ export type AttachmentPayload = {
   size: number;
   content?: string;
   error?: string;
+  width?: number;
+  height?: number;
+  original_name?: string;
+  original_type?: string;
+  original_size?: number;
+  preview?: string;
+  workspace_path?: string;
+  url?: string;
 };
 
 export type Memory = {
   id: number;
+  user_id: number;
   content: string;
   source: string;
   category: string;
-  weight: number;
+  origin: string;
+  tokens: number;
   enabled: boolean;
+  embedding_model: string;
+  embedding_dim: number;
+  embedding_updated_at: string;
+  embedding_status: 'disabled' | 'pending' | 'ready' | 'stale';
+  created_at: string;
+  updated_at: string;
+};
+
+export type MemoryHitPayload = {
+  method: string;
+  model: string;
+  dim: number;
+  memories: MemoryHit[];
+};
+
+export type MemoryHit = Memory & {
+  score: number;
+  vector_score: number;
+  rerank_score?: number;
+  reason?: string;
 };

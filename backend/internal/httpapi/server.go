@@ -54,6 +54,7 @@ func (s *Server) Routes() http.Handler {
 			"time":    db.Now(),
 		})
 	})
+	r.Get("/api/workspace/public/*", s.handlePublicWorkspaceFile)
 
 	r.Route("/api/auth", func(r chi.Router) {
 		r.Post("/register", s.handleRegister)
@@ -65,9 +66,12 @@ func (s *Server) Routes() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(s.requireUser)
 		r.Get("/api/settings", s.handleGetClientSettings)
+		r.Get("/api/workspace/files/*", s.handleWorkspaceFile)
 		r.Get("/api/provider-capabilities", s.handleProviderCapabilities)
 		r.Get("/api/conversations", s.handleListConversations)
 		r.Post("/api/conversations", s.handleCreateConversation)
+		r.Delete("/api/conversations", s.handleClearConversations)
+		r.Get("/api/conversations/session/{sessionID}", s.handleGetConversationBySession)
 		r.Get("/api/conversations/{id}", s.handleGetConversation)
 		r.Patch("/api/conversations/{id}", s.handleUpdateConversation)
 		r.Delete("/api/conversations/{id}", s.handleDeleteConversation)
