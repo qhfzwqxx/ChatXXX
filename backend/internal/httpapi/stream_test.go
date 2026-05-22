@@ -1938,6 +1938,96 @@ func TestStreamResponsesRetriesUnexpectedEOFBeforeToolCall(t *testing.T) {
 	}
 }
 
+func TestStreamResponsesPreservesReasoningSummaryForToolContinuation(t *testing.T) {
+	store := newTestStore(t)
+	server := &Server{store: store}
+	var secondRequest map[string]interface{}
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("unexpected responses path: %s", r.URL.Path)
+		}
+		calls++
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode responses body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		switch calls {
+		case 1:
+			fmt.Fprint(w, "event: response.completed\n")
+			fmt.Fprint(w, "data: "+mustJSONStringForTest(map[string]interface{}{
+				"response": map[string]interface{}{
+					"output": []map[string]interface{}{
+						{
+							"id":      "rs_1",
+							"type":    "reasoning",
+							"summary": []interface{}{},
+						},
+						{
+							"type":      "function_call",
+							"id":        "fc_time",
+							"call_id":   "call_time",
+							"name":      "get_current_time",
+							"arguments": `{"timezone":"Asia/Shanghai"}`,
+							"status":    "completed",
+						},
+					},
+				},
+			})+"\n\n")
+		case 2:
+			secondRequest = body
+			fmt.Fprint(w, "event: response.output_text.delta\n")
+			fmt.Fprint(w, `data: {"delta":"完成"}`)
+			fmt.Fprint(w, "\n\n")
+			fmt.Fprint(w, "event: response.completed\n")
+			fmt.Fprint(w, "data: "+mustJSONStringForTest(map[string]interface{}{
+				"response": map[string]interface{}{
+					"output": []map[string]interface{}{
+						{
+							"type": "message",
+							"role": "assistant",
+							"content": []map[string]string{
+								{"type": "output_text", "text": "完成"},
+							},
+						},
+					},
+				},
+			})+"\n\n")
+		default:
+			t.Fatalf("unexpected extra responses call")
+		}
+	}))
+	defer upstream.Close()
+
+	provider := runtimeProvider{Base: upstream.URL, Key: "llm-key", Model: "main-model", RequestMode: "responses"}
+	text, err := server.streamResponses(context.Background(), httptest.NewRecorder(), provider, &Conversation{}, 1, 1, "现在几点", "", "", "", nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("stream responses: %v", err)
+	}
+	if text != "完成" {
+		t.Fatalf("unexpected text: %q", text)
+	}
+	input, _ := secondRequest["input"].([]interface{})
+	if len(input) < 1 {
+		t.Fatalf("expected second request input, got %#v", secondRequest)
+	}
+	var reasoning map[string]interface{}
+	for _, item := range input {
+		obj, _ := item.(map[string]interface{})
+		if obj["type"] == "reasoning" {
+			reasoning = obj
+			break
+		}
+	}
+	if reasoning == nil {
+		t.Fatalf("expected reasoning output item to be preserved, got %#v", input)
+	}
+	if _, ok := reasoning["summary"]; !ok {
+		t.Fatalf("expected reasoning summary to be preserved, got %#v", reasoning)
+	}
+}
+
 func TestUserFacingModelStreamErrorHidesUnexpectedEOF(t *testing.T) {
 	if got := userFacingModelStreamError(io.ErrUnexpectedEOF); strings.Contains(strings.ToLower(got), "eof") || got == "" {
 		t.Fatalf("expected friendly EOF message, got %q", got)

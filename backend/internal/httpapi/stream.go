@@ -96,14 +96,16 @@ type responseInputMessage struct {
 }
 
 type responseOutputItem struct {
-	Type      string                  `json:"type"`
-	ID        string                  `json:"id,omitempty"`
-	CallID    string                  `json:"call_id,omitempty"`
-	Name      string                  `json:"name,omitempty"`
-	Arguments string                  `json:"arguments,omitempty"`
-	Role      string                  `json:"role,omitempty"`
-	Status    string                  `json:"status,omitempty"`
-	Content   []responseOutputContent `json:"content,omitempty"`
+	Type             string                  `json:"type"`
+	ID               string                  `json:"id,omitempty"`
+	CallID           string                  `json:"call_id,omitempty"`
+	Name             string                  `json:"name,omitempty"`
+	Arguments        string                  `json:"arguments,omitempty"`
+	Role             string                  `json:"role,omitempty"`
+	Status           string                  `json:"status,omitempty"`
+	Content          []responseOutputContent `json:"content,omitempty"`
+	Summary          json.RawMessage         `json:"summary,omitempty"`
+	EncryptedContent string                  `json:"encrypted_content,omitempty"`
 }
 
 type responseFunctionCallOutput struct {
@@ -1469,6 +1471,12 @@ func mergeResponseOutputItem(prev, next responseOutputItem) responseOutputItem {
 	}
 	if len(next.Content) > 0 {
 		prev.Content = next.Content
+	}
+	if len(next.Summary) > 0 {
+		prev.Summary = next.Summary
+	}
+	if next.EncryptedContent != "" {
+		prev.EncryptedContent = next.EncryptedContent
 	}
 	return prev
 }
