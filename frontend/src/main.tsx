@@ -10,6 +10,7 @@ import {
   ChevronLeft,
   CircleCheck,
   Copy,
+  Download,
   Edit3,
   LayoutDashboard,
   LogOut,
@@ -2024,7 +2025,20 @@ function ImageToolCard({ step, status }: { step: ToolStep; status: { kind: strin
     <section className={'image-tool-card image-tool-card--' + status.kind} title={toolStepSummary(step)}>
       <div className="image-tool-card__head">
         <span>{status.kind === 'running' ? runningText : title}</span>
-        <small>{status.label}</small>
+        <div className="image-tool-card__actions">
+          {images.length > 0 && (
+            <button
+              className="image-tool-card__download"
+              type="button"
+              aria-label="下载图片"
+              title="下载图片"
+              onClick={() => downloadImageToolSource(images[0], imageToolDownloadName(step, 0))}
+            >
+              <Download size={17} strokeWidth={2} />
+            </button>
+          )}
+          <small>{status.label}</small>
+        </div>
       </div>
       {status.kind === 'running' ? (
         <>
@@ -2061,6 +2075,38 @@ function imageToolSource(item: { url?: string; b64_json?: string }) {
   if (item.url) return item.url;
   if (item.b64_json) return item.b64_json.startsWith('data:') ? item.b64_json : `data:image/png;base64,${item.b64_json}`;
   return '';
+}
+
+async function downloadImageToolSource(src: string, fileName: string) {
+  if (!src) return;
+  try {
+    const response = await fetch(src);
+    if (!response.ok) throw new Error(`download failed: ${response.status}`);
+    const blob = await response.blob();
+    triggerImageDownload(URL.createObjectURL(blob), fileName, true);
+  } catch {
+    triggerImageDownload(src, fileName, false);
+  }
+}
+
+function triggerImageDownload(href: string, fileName: string, revoke: boolean) {
+  const link = document.createElement('a');
+  link.href = href;
+  link.download = fileName;
+  link.rel = 'noreferrer';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  if (revoke) {
+    window.setTimeout(() => URL.revokeObjectURL(href), 1000);
+  }
+}
+
+function imageToolDownloadName(step: ToolStep, index: number) {
+  const prefix = step.name === 'image_edit' ? 'chatxxx-image-edit' : 'chatxxx-image';
+  const timestamp = step.timestamp ? Date.parse(step.timestamp) : Date.now();
+  const suffix = Number.isFinite(timestamp) ? new Date(timestamp).toISOString().replace(/[:.]/g, '-') : String(Date.now());
+  return `${prefix}-${suffix}-${index + 1}.png`;
 }
 
 function WebSearchToolCard({ step, status, resultCount }: { step: ToolStep; status: { kind: string; label: string }; resultCount: number }) {

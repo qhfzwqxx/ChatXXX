@@ -1793,6 +1793,43 @@ textarea {
   font-size: 12px;
 }
 
+.image-tool-card__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.image-tool-card__download {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+  box-shadow: none;
+  -webkit-tap-highlight-color: transparent;
+  appearance: none;
+}
+
+.image-tool-card__download:hover {
+  background: transparent;
+  color: var(--text);
+  box-shadow: none;
+}
+
+.image-tool-card__download:active,
+.image-tool-card__download:focus,
+.image-tool-card__download:focus-visible {
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  box-shadow: none;
+}
+
 .image-tool-card__grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));
