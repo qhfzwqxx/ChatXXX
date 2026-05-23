@@ -211,7 +211,7 @@ func (s *Store) migrate() error {
 		{"memory_max_actions_per_run", "5"},
 		{"memory_inject_limit", "20"},
 		{"embedding_top_k", "8"},
-		{"image_tool_mode", "image_api"},
+		{"image_tool_mode", "responses"},
 		{"image_tool_base_url", "https://api.tu-zi.com"},
 		{"image_generate_model", "gpt-image-2"},
 		{"image_edit_model", "gpt-image-1.5"},

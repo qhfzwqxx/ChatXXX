@@ -442,8 +442,11 @@ func TestResponseToolDefinitionsRespectSearchMode(t *testing.T) {
 	if !hasToolForTest(unifuncsTools, "web_search") || !hasToolForTest(unifuncsTools, "web_reader") {
 		t.Fatalf("unifuncs mode should expose web_search and web_reader: %#v", unifuncsTools)
 	}
-	if !hasToolForTest(unifuncsTools, "image_generate") || !hasToolForTest(unifuncsTools, "image_edit") {
-		t.Fatalf("unifuncs mode should expose image tools: %#v", unifuncsTools)
+	if !hasToolForTest(unifuncsTools, "response_image") {
+		t.Fatalf("unifuncs mode should expose the default response_image tool: %#v", unifuncsTools)
+	}
+	if hasToolForTest(unifuncsTools, "chat_image") || hasToolForTest(unifuncsTools, "image_generate") || hasToolForTest(unifuncsTools, "image_edit") {
+		t.Fatalf("default image mode should not expose inactive image tools: %#v", unifuncsTools)
 	}
 	if hasToolForTest(unifuncsTools, "searching") {
 		t.Fatalf("unifuncs mode should not expose searching: %#v", unifuncsTools)
@@ -452,11 +455,37 @@ func TestResponseToolDefinitionsRespectSearchMode(t *testing.T) {
 	if !hasToolForTest(searchingTools, "searching") {
 		t.Fatalf("searching mode should expose searching: %#v", searchingTools)
 	}
-	if !hasToolForTest(searchingTools, "image_generate") || !hasToolForTest(searchingTools, "image_edit") {
-		t.Fatalf("searching mode should expose image tools: %#v", searchingTools)
+	if !hasToolForTest(searchingTools, "response_image") {
+		t.Fatalf("searching mode should expose the default response_image tool: %#v", searchingTools)
 	}
 	if hasToolForTest(searchingTools, "web_search") || hasToolForTest(searchingTools, "web_reader") {
 		t.Fatalf("searching mode should not expose UniFuncs tools: %#v", searchingTools)
+	}
+}
+
+func TestResponseToolDefinitionsRespectImageMode(t *testing.T) {
+	responsesTools := responseToolDefinitionsForImageMode(searchToolModeSearching, imageToolModeResponses)
+	if !hasToolForTest(responsesTools, "response_image") {
+		t.Fatalf("responses image mode should expose response_image: %#v", responsesTools)
+	}
+	if hasToolForTest(responsesTools, "chat_image") || hasToolForTest(responsesTools, "image_generate") || hasToolForTest(responsesTools, "image_edit") {
+		t.Fatalf("responses image mode should only expose response_image: %#v", responsesTools)
+	}
+
+	chatTools := responseToolDefinitionsForImageMode(searchToolModeSearching, imageToolModeChatCompletions)
+	if !hasToolForTest(chatTools, "chat_image") {
+		t.Fatalf("chat image mode should expose chat_image: %#v", chatTools)
+	}
+	if hasToolForTest(chatTools, "response_image") || hasToolForTest(chatTools, "image_generate") || hasToolForTest(chatTools, "image_edit") {
+		t.Fatalf("chat image mode should only expose chat_image: %#v", chatTools)
+	}
+
+	imageAPITools := responseToolDefinitionsForImageMode(searchToolModeSearching, imageToolModeImageAPI)
+	if !hasToolForTest(imageAPITools, "image_generate") || !hasToolForTest(imageAPITools, "image_edit") {
+		t.Fatalf("image API mode should expose image_generate and image_edit: %#v", imageAPITools)
+	}
+	if hasToolForTest(imageAPITools, "response_image") || hasToolForTest(imageAPITools, "chat_image") {
+		t.Fatalf("image API mode should not expose response/chat image tools: %#v", imageAPITools)
 	}
 }
 
@@ -484,6 +513,7 @@ func TestExecuteImageGenerateToolUsesDocumentedJSONFormat(t *testing.T) {
 	store := newTestStore(t)
 	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
 	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":       imageToolModeImageAPI,
 		"image_tool_base_url":   upstream.URL,
 		"image_tool_api_key":    "image-key",
 		"image_generate_model":  "gpt-image-2",
@@ -537,6 +567,7 @@ func TestExecuteImageGenerateToolRetriesTransientProviderError(t *testing.T) {
 	store := newTestStore(t)
 	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
 	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":       imageToolModeImageAPI,
 		"image_tool_base_url":   upstream.URL,
 		"image_tool_api_key":    "image-key",
 		"image_generate_model":  "gpt-image-2",
@@ -569,6 +600,7 @@ func TestExecuteImageGenerateToolShowsFriendlyTransientProviderError(t *testing.
 	store := newTestStore(t)
 	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
 	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":       imageToolModeImageAPI,
 		"image_tool_base_url":   upstream.URL,
 		"image_tool_api_key":    "image-key",
 		"image_generate_model":  "gpt-image-2",
@@ -644,12 +676,12 @@ func TestExecuteImageGenerateToolUsesResponsesMode(t *testing.T) {
 		"image_default_quality": "auto",
 		"image_response_format": "url",
 	})
-	raw := server.executeImageGenerateTool(`{"prompt":"画一只猫","image":"https://example.com/ref.png","model":"gpt-image-2"}`)
+	raw := server.executeResponseImageTool(`{"prompt":"画一只猫","image":"https://example.com/ref.png","model":"gpt-image-2"}`, responseToolContext{})
 	var got imageToolResult
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatalf("unmarshal image output: %v", err)
 	}
-	if !got.OK || got.Tool != "image_generate" || len(got.Images) != 1 || got.Images[0].B64JSON == "" {
+	if !got.OK || got.Tool != "response_image" || len(got.Images) != 1 || got.Images[0].B64JSON != "" {
 		t.Fatalf("unexpected output: %s", raw)
 	}
 	if gotAuth != "Bearer image-key" {
@@ -657,6 +689,9 @@ func TestExecuteImageGenerateToolUsesResponsesMode(t *testing.T) {
 	}
 	if gotContentType != "application/json" {
 		t.Fatalf("unexpected content-type: %s", gotContentType)
+	}
+	if strings.Contains(raw, "b64_json") || strings.Contains(raw, imageData) {
+		t.Fatalf("responses image output should not include base64 data: %.240s", raw)
 	}
 	if gotBody["model"] != "gpt-5.5" {
 		t.Fatalf("expected configured responses model, got %#v", gotBody["model"])
@@ -726,12 +761,12 @@ func TestExecuteImageGenerateToolUsesChatCompletionsCompatibilityMode(t *testing
 		"image_tool_api_key":  "image-key",
 		"image_chat_model":    "gpt-4o-image",
 	})
-	raw := server.executeImageGenerateTool(`{"prompt":"画一只猫","image":["https://example.com/ref.png"]}`)
+	raw := server.executeChatImageTool(`{"prompt":"画一只猫","image":["https://example.com/ref.png"]}`, responseToolContext{})
 	var got imageToolResult
 	if err := json.Unmarshal([]byte(raw), &got); err != nil {
 		t.Fatalf("unmarshal image output: %v", err)
 	}
-	if !got.OK || got.Tool != "image_generate" || len(got.Images) != 1 || got.Images[0].URL != "https://example.com/generated-cat.png" {
+	if !got.OK || got.Tool != "chat_image" || len(got.Images) != 1 || got.Images[0].URL != "https://example.com/generated-cat.png" {
 		t.Fatalf("unexpected output: %s", raw)
 	}
 	if gotAuth != "Bearer image-key" {
@@ -826,6 +861,7 @@ func TestResponsesImageToolResultReturnsToModel(t *testing.T) {
 	defer image.Close()
 
 	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":       imageToolModeImageAPI,
 		"image_tool_base_url":   image.URL,
 		"image_tool_api_key":    "image-key",
 		"image_generate_model":  "gpt-image-2",
@@ -919,7 +955,7 @@ func TestStreamResponsesImageGenerateUsesResponsesImageMode(t *testing.T) {
 		switch responseCalls {
 		case 1:
 			fmt.Fprint(w, "event: response.completed\n")
-			fmt.Fprint(w, `data: {"response":{"output":[{"type":"function_call","id":"fc_responses_image","call_id":"call_responses_image","name":"image_generate","arguments":"{\"prompt\":\"画一只猫\",\"image\":\"https://example.com/ref.png\"}","status":"completed"}]}}`)
+			fmt.Fprint(w, `data: {"response":{"output":[{"type":"function_call","id":"fc_responses_image","call_id":"call_responses_image","name":"response_image","arguments":"{\"prompt\":\"画一只猫\",\"image\":\"https://example.com/ref.png\"}","status":"completed"}]}}`)
 			fmt.Fprint(w, "\n\n")
 		case 2:
 			secondRequest = body
@@ -946,8 +982,8 @@ func TestStreamResponsesImageGenerateUsesResponsesImageMode(t *testing.T) {
 	}
 	assertResponsesImageModeRequestForTest(t, imageRequest)
 	assertFunctionCallOutputImageForTest(t, secondRequest, "call_responses_image", func(output imageToolResult) {
-		if len(output.Images) != 1 || output.Images[0].B64JSON != "" || output.Images[0].URL != "" || !strings.HasPrefix(output.Images[0].WorkspacePath, "users/1/generated/") {
-			t.Fatalf("expected model-facing output to omit inline image data, got %#v", output.Images)
+		if len(output.Images) != 1 || output.Images[0].B64JSON != "" || output.Images[0].URL == "" || !strings.HasPrefix(output.Images[0].WorkspacePath, "users/1/generated/") {
+			t.Fatalf("expected model-facing output to keep URL/workspace references and omit inline data, got %#v", output.Images)
 		}
 	})
 	if !hasSuccessfulImageToolStep(toolSteps) {
@@ -988,7 +1024,7 @@ func TestResponsesImageModeCanReuseGeneratedBase64Image(t *testing.T) {
 		"image_tool_api_key":    "image-key",
 		"image_responses_model": "gpt-5.5",
 	})
-	firstLLM := llmToolServerForTest(t, `{"prompt":"画一只猫"}`, "第一张好了")
+	firstLLM := llmToolServerForTest(t, "response_image", `{"prompt":"画一只猫"}`, "第一张好了")
 	metadata := runSingleImageToolConversationForTest(t, server, runtimeProvider{Base: firstLLM.URL, Key: "llm-key", Model: "main-model", RequestMode: "responses"}, "请画一只猫")
 	if len(imageRequests) != 1 {
 		t.Fatalf("expected first image request, got %d", len(imageRequests))
@@ -1006,7 +1042,7 @@ func TestResponsesImageModeCanReuseGeneratedBase64Image(t *testing.T) {
 	if _, err := server.insertMessage(1, 1, "user", "基于刚才那张图加一点赛博朋克霓虹", "completed", "{}"); err != nil {
 		t.Fatalf("insert second user: %v", err)
 	}
-	reuseLLM := llmToolServerForTest(t, `{"prompt":"基于刚才那张图加一点赛博朋克霓虹","image":"`+firstGeneratedWorkspacePathForTest(t, metadata)+`"}`, "第二张好了")
+	reuseLLM := llmToolServerForTest(t, "response_image", `{"prompt":"基于刚才那张图加一点赛博朋克霓虹","image":"`+firstGeneratedWorkspacePathForTest(t, metadata)+`"}`, "第二张好了")
 	defer reuseLLM.Close()
 	_, err = server.streamResponses(context.Background(), httptest.NewRecorder(), runtimeProvider{Base: reuseLLM.URL, Key: "llm-key", Model: "main-model", RequestMode: "responses"}, nil, 1, 1, "", "", "", "https://chat.example.com", nil, nil, nil, nil)
 	if err != nil {
@@ -1063,7 +1099,7 @@ func TestStreamResponsesImageGenerateUsesChatCompletionsImageMode(t *testing.T) 
 		switch responseCalls {
 		case 1:
 			fmt.Fprint(w, "event: response.completed\n")
-			fmt.Fprint(w, `data: {"response":{"output":[{"type":"function_call","id":"fc_chat_image","call_id":"call_chat_image","name":"image_generate","arguments":"{\"prompt\":\"画一只狗\",\"image\":\"https://example.com/ref.png\"}","status":"completed"}]}}`)
+			fmt.Fprint(w, `data: {"response":{"output":[{"type":"function_call","id":"fc_chat_image","call_id":"call_chat_image","name":"chat_image","arguments":"{\"prompt\":\"画一只狗\",\"image\":\"https://example.com/ref.png\"}","status":"completed"}]}}`)
 			fmt.Fprint(w, "\n\n")
 		case 2:
 			secondRequest = body
@@ -1130,7 +1166,7 @@ func TestChatCompletionsImageModeCanReuseGeneratedBase64Image(t *testing.T) {
 		"image_tool_api_key":  "image-key",
 		"image_chat_model":    "gpt-4o-image",
 	})
-	firstLLM := llmToolServerForTest(t, `{"prompt":"画一只狗"}`, "第一张好了")
+	firstLLM := llmToolServerForTest(t, "chat_image", `{"prompt":"画一只狗"}`, "第一张好了")
 	metadata := runSingleImageToolConversationForTest(t, server, runtimeProvider{Base: firstLLM.URL, Key: "llm-key", Model: "main-model", RequestMode: "responses"}, "请画一只狗")
 	if len(imageRequests) != 1 {
 		t.Fatalf("expected first image request, got %d", len(imageRequests))
@@ -1142,7 +1178,7 @@ func TestChatCompletionsImageModeCanReuseGeneratedBase64Image(t *testing.T) {
 		t.Fatalf("insert second user: %v", err)
 	}
 	path := firstGeneratedWorkspacePathForTest(t, metadata)
-	reuseLLM := llmToolServerForTest(t, `{"prompt":"基于刚才那张图加一副墨镜","image":"`+path+`"}`, "第二张好了")
+	reuseLLM := llmToolServerForTest(t, "chat_image", `{"prompt":"基于刚才那张图加一副墨镜","image":"`+path+`"}`, "第二张好了")
 	defer reuseLLM.Close()
 	_, err := server.streamResponses(context.Background(), httptest.NewRecorder(), runtimeProvider{Base: reuseLLM.URL, Key: "llm-key", Model: "main-model", RequestMode: "responses"}, nil, 1, 1, "", "", "", "https://chat.example.com", nil, nil, nil, nil)
 	if err != nil {
@@ -1202,7 +1238,7 @@ func TestStreamResponsesKeepsSuccessfulImageWhenAssistantSummaryFails(t *testing
 							"type":      "function_call",
 							"id":        "fc_1",
 							"call_id":   "call_1",
-							"name":      "image_generate",
+							"name":      "response_image",
 							"arguments": `{"prompt":"画一只猫"}`,
 							"status":    "completed",
 						},
@@ -1250,6 +1286,7 @@ func TestExecuteImageGenerateToolResolvesWorkspaceReference(t *testing.T) {
 	store := newTestStore(t)
 	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
 	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":     imageToolModeImageAPI,
 		"image_tool_base_url": upstream.URL,
 		"image_tool_api_key":  "image-key",
 	})
@@ -1324,11 +1361,12 @@ func TestExecuteImageEditToolUsesDocumentedMultipartFormat(t *testing.T) {
 	store := newTestStore(t)
 	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
 	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode":       imageToolModeImageAPI,
 		"image_tool_base_url":   upstream.URL,
 		"image_tool_api_key":    "image-key",
 		"image_edit_model":      "gpt-image-1.5",
 		"image_edit_size":       "1:1",
-		"image_response_format": "b64_json",
+		"image_response_format": "url",
 	})
 	if _, err := store.DB.Exec(`INSERT INTO users (id, email, name, password_hash, role, status, created_at, updated_at) VALUES (1, 'u@test.local', 'u', 'x', 'user', 'active', ?, ?)`, db.Now(), db.Now()); err != nil {
 		t.Fatalf("insert user: %v", err)
@@ -1362,7 +1400,7 @@ func TestExecuteImageEditToolUsesDocumentedMultipartFormat(t *testing.T) {
 	if gotAuth != "Bearer image-key" || !strings.HasPrefix(gotContentType, "multipart/form-data; boundary=") {
 		t.Fatalf("unexpected headers auth=%s content-type=%s", gotAuth, gotContentType)
 	}
-	if gotFields["model"] != "gpt-image-1.5" || gotFields["prompt"] != "改成水彩" || gotFields["size"] != "1:1" || gotFields["response_format"] != "b64_json" || gotFields["n"] != "1" {
+	if gotFields["model"] != "gpt-image-1.5" || gotFields["prompt"] != "改成水彩" || gotFields["size"] != "1:1" || gotFields["response_format"] != "url" || gotFields["n"] != "1" {
 		t.Fatalf("unexpected fields: %#v", gotFields)
 	}
 	if len(gotFileNames) != 1 || !strings.Contains(gotFileNames[0], "image:source.png:image/png") {
@@ -1434,11 +1472,11 @@ func TestWorkspaceSystemPromptListsMessageAttachmentMetadata(t *testing.T) {
 func TestMessagePromptContentIncludesGeneratedImageURLs(t *testing.T) {
 	metadata := assistantMetadataWithToolSteps([]responseToolStep{
 		{
-			Name:   "image_generate",
+			Name:   "response_image",
 			Status: "completed",
 			Output: mustJSONString(imageToolResult{
 				OK:   true,
-				Tool: "image_generate",
+				Tool: "response_image",
 				Images: []imageToolResultImage{
 					{URL: "https://example.com/generated-cat.png"},
 					{B64JSON: "ZmFrZQ=="},
@@ -1451,7 +1489,7 @@ func TestMessagePromptContentIncludesGeneratedImageURLs(t *testing.T) {
 		Content:  "",
 		Metadata: metadata,
 	})
-	if !strings.Contains(content, "https://example.com/generated-cat.png") || !strings.Contains(content, "image_generate") {
+	if !strings.Contains(content, "https://example.com/generated-cat.png") || !strings.Contains(content, "response_image") {
 		t.Fatalf("expected generated image URL in prompt content, got %s", content)
 	}
 	if strings.Contains(content, "ZmFrZQ==") || strings.Contains(content, "data:image") {
@@ -1532,6 +1570,22 @@ func TestExecuteResponseToolDisablesInactiveSearchModeTools(t *testing.T) {
 	searchingDisabled := server.executeResponseTool(responseToolCall{Name: "searching", Arguments: `{"query":"news"}`}, searchToolModeUniFuncs)
 	if !strings.Contains(searchingDisabled, "disabled") {
 		t.Fatalf("expected searching disabled in unifuncs mode: %s", searchingDisabled)
+	}
+}
+
+func TestExecuteResponseToolDisablesInactiveImageModeTools(t *testing.T) {
+	store := newTestStore(t)
+	server := &Server{store: store, cfg: config.Config{WorkspacePath: t.TempDir()}}
+	insertSettingsForTest(t, store, map[string]string{
+		"image_tool_mode": imageToolModeResponses,
+	})
+	disabledGenerate := server.executeResponseTool(responseToolCall{Name: "image_generate", Arguments: `{"prompt":"cat"}`}, searchToolModeSearching)
+	if !strings.Contains(disabledGenerate, "disabled") {
+		t.Fatalf("expected image_generate disabled outside Image API mode: %s", disabledGenerate)
+	}
+	disabledChat := server.executeResponseTool(responseToolCall{Name: "chat_image", Arguments: `{"prompt":"cat"}`}, searchToolModeSearching)
+	if !strings.Contains(disabledChat, "disabled") {
+		t.Fatalf("expected chat_image disabled outside Chat Completions mode: %s", disabledChat)
 	}
 }
 
@@ -2420,7 +2474,7 @@ func assertFunctionCallOutputImageForTest(t *testing.T, request map[string]inter
 		if err := json.Unmarshal([]byte(outputRaw), &output); err != nil {
 			t.Fatalf("unmarshal tool output: %v", err)
 		}
-		if !output.OK || output.Tool != "image_generate" {
+		if !output.OK || !isImageToolName(output.Tool) {
 			t.Fatalf("unexpected image tool output: %#v", output)
 		}
 		if strings.Contains(outputRaw, "data:image/") || strings.Contains(outputRaw, "base64") || strings.Contains(outputRaw, "b64_json") {
@@ -2432,9 +2486,12 @@ func assertFunctionCallOutputImageForTest(t *testing.T, request map[string]inter
 	t.Fatalf("expected function_call_output for %s in %#v", callID, request["input"])
 }
 
-func llmToolServerForTest(t *testing.T, arguments, finalText string) *httptest.Server {
+func llmToolServerForTest(t *testing.T, toolName, arguments, finalText string) *httptest.Server {
 	t.Helper()
 	var calls int
+	if toolName == "" {
+		toolName = "image_generate"
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
 			t.Fatalf("unexpected LLM path: %s", r.URL.Path)
@@ -2451,7 +2508,7 @@ func llmToolServerForTest(t *testing.T, arguments, finalText string) *httptest.S
 							"type":      "function_call",
 							"id":        fmt.Sprintf("fc_%d", calls),
 							"call_id":   fmt.Sprintf("call_%d", calls),
-							"name":      "image_generate",
+							"name":      toolName,
 							"arguments": arguments,
 							"status":    "completed",
 						},

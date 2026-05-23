@@ -86,12 +86,88 @@ func (e imageTransportError) Unwrap() error {
 	return e.Err
 }
 
-func imageToolDefinitions() []map[string]interface{} {
+const (
+	imageToolNameResponseImage = "response_image"
+	imageToolNameChatImage     = "chat_image"
+	imageToolNameGenerate      = "image_generate"
+	imageToolNameEdit          = "image_edit"
+)
+
+func isImageToolName(name string) bool {
+	switch strings.TrimSpace(name) {
+	case imageToolNameResponseImage, imageToolNameChatImage, imageToolNameGenerate, imageToolNameEdit:
+		return true
+	default:
+		return false
+	}
+}
+
+func imageToolDefinitions(mode string) []map[string]interface{} {
+	switch normalizeImageToolMode(mode) {
+	case imageToolModeResponses:
+		return []map[string]interface{}{singleImageToolDefinition(
+			imageToolNameResponseImage,
+			"Generate or regenerate an image through the Responses image_generation tool. This is the only image tool available in Responses mode. Use it for text-to-image and image-to-image/reference generation, including 图生图, 以这张图为参考生成, 以这张图为基础生成, 换风格生成, style transfer, or use this image as reference. Pass only image URLs or workspace paths in the image argument; never pass base64.",
+		)}
+	case imageToolModeChatCompletions:
+		return []map[string]interface{}{singleImageToolDefinition(
+			imageToolNameChatImage,
+			"Generate or regenerate an image through the Chat Completions compatible image model. This is the only image tool available in Chat Completions mode. Use it for text-to-image and image-to-image/reference generation, including 图生图, 以这张图为参考生成, 以这张图为基础生成, 换风格生成, style transfer, or use this image as reference. Pass only image URLs or workspace paths in the image argument; never pass base64.",
+		)}
+	default:
+		return imageAPIToolDefinitions()
+	}
+}
+
+func singleImageToolDefinition(name, description string) map[string]interface{} {
+	return map[string]interface{}{
+		"type":        "function",
+		"name":        name,
+		"description": description,
+		"parameters": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"prompt": map[string]interface{}{
+					"type":        "string",
+					"description": "Required image description. Maximum 5000 characters.",
+				},
+				"image": map[string]interface{}{
+					"description": "Optional reference image(s) for image-to-image generation. Use only URL strings or workspace paths such as users/1/uploads/...; the backend resolves workspace paths to temporary external URLs.",
+					"anyOf": []map[string]interface{}{
+						{"type": "string"},
+						{"type": "array", "items": map[string]interface{}{"type": "string"}},
+					},
+				},
+				"size": map[string]interface{}{
+					"type":        "string",
+					"description": "Image size, for example 1024x1024, 1024x1536, 1536x1024, or auto.",
+				},
+				"quality": map[string]interface{}{
+					"type":        "string",
+					"description": "Image quality.",
+					"enum":        []string{"auto", "low", "medium", "high"},
+				},
+				"n": map[string]interface{}{
+					"type":        "integer",
+					"description": "Number of images to generate, 1 to 10.",
+				},
+				"user": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional end-user identifier.",
+				},
+			},
+			"required":             []string{"prompt"},
+			"additionalProperties": false,
+		},
+	}
+}
+
+func imageAPIToolDefinitions() []map[string]interface{} {
 	imageModelEnum := []string{"gpt-image-2", "gpt-image-1.5", "gpt-image-1", "gpt-4o-image-vip", "gpt-4o-image"}
 	return []map[string]interface{}{
 		{
 			"type":        "function",
-			"name":        "image_generate",
+			"name":        imageToolNameGenerate,
 			"description": "Create a new image through the general image generation endpoint. Use for text-to-image, image-to-image/reference generation, and any image change when the user has not provided/requested a mask. Choose this when an uploaded or previously generated image URL is a reference, inspiration, base, style, pose, subject, or composition source, including 图生图, 以这张图为参考生成, 以这张图为基础生成, 参考图重新画, 换风格生成, style transfer, or use this image as reference. Pass workspace paths or generated image URLs in the image argument. If there is no mask, use this tool instead of image_edit.",
 			"parameters": map[string]interface{}{
 				"type": "object",
@@ -106,7 +182,7 @@ func imageToolDefinitions() []map[string]interface{} {
 						"enum":        imageModelEnum,
 					},
 					"image": map[string]interface{}{
-						"description": "Reference image(s) for image-to-image generation. Use this for uploaded images that should guide the new image. Accepts URL/base64/workspace path string or array. Workspace paths such as users/1/uploads/... are resolved to temporary external URLs by the backend.",
+						"description": "Reference image(s) for image-to-image generation. Use this for uploaded images that should guide the new image. Accepts URL or workspace path string/array. Workspace paths such as users/1/uploads/... are resolved to temporary external URLs by the backend. Do not pass base64.",
 						"anyOf": []map[string]interface{}{
 							{"type": "string"},
 							{"type": "array", "items": map[string]interface{}{"type": "string"}},
@@ -118,8 +194,8 @@ func imageToolDefinitions() []map[string]interface{} {
 					},
 					"response_format": map[string]interface{}{
 						"type":        "string",
-						"description": "Return format.",
-						"enum":        []string{"url", "b64_json"},
+						"description": "Upstream return format. The backend stores inline images and returns URL/workspace references to the chat context.",
+						"enum":        []string{"url"},
 					},
 					"quality": map[string]interface{}{
 						"type":        "string",
@@ -145,7 +221,7 @@ func imageToolDefinitions() []map[string]interface{} {
 		},
 		{
 			"type":        "function",
-			"name":        "image_edit",
+			"name":        imageToolNameEdit,
 			"description": "Mask-based image editing endpoint. Use this only when the user explicitly provides or asks to use a mask/mask image/mask_index/mask_path for a local edit, inpainting/outpainting, or masked region change. If no mask is provided or requested, do not call image_edit; call image_generate instead, even if the user says edit/change/modify. Do not use for 图生图, reference generation, style transfer, or generating a new image inspired by an upload.",
 			"parameters": map[string]interface{}{
 				"type": "object",
@@ -186,8 +262,8 @@ func imageToolDefinitions() []map[string]interface{} {
 					},
 					"response_format": map[string]interface{}{
 						"type":        "string",
-						"description": "Return format.",
-						"enum":        []string{"url", "b64_json"},
+						"description": "Upstream return format. The backend stores inline images and returns URL/workspace references to the chat context.",
+						"enum":        []string{"url"},
 					},
 					"n": map[string]interface{}{
 						"type":        "integer",
@@ -210,6 +286,18 @@ func (s *Server) executeImageGenerateTool(arguments string) string {
 }
 
 func (s *Server) executeImageGenerateToolWithContext(arguments string, toolCtx responseToolContext) string {
+	return s.executeImageToolWithMode(imageToolNameGenerate, imageToolModeImageAPI, arguments, toolCtx)
+}
+
+func (s *Server) executeResponseImageTool(arguments string, toolCtx responseToolContext) string {
+	return s.executeImageToolWithMode(imageToolNameResponseImage, imageToolModeResponses, arguments, toolCtx)
+}
+
+func (s *Server) executeChatImageTool(arguments string, toolCtx responseToolContext) string {
+	return s.executeImageToolWithMode(imageToolNameChatImage, imageToolModeChatCompletions, arguments, toolCtx)
+}
+
+func (s *Server) executeImageToolWithMode(tool, mode, arguments string, toolCtx responseToolContext) string {
 	var args struct {
 		Model          string      `json:"model"`
 		Prompt         string      `json:"prompt"`
@@ -226,16 +314,15 @@ func (s *Server) executeImageGenerateToolWithContext(arguments string, toolCtx r
 	}
 	prompt := strings.TrimSpace(args.Prompt)
 	if prompt == "" {
-		return imageToolErrorJSON("image_generate", "prompt is required")
+		return imageToolErrorJSON(tool, "prompt is required")
 	}
 	if len([]rune(prompt)) > 5000 {
-		return imageToolErrorJSON("image_generate", "prompt must be at most 5000 characters")
+		return imageToolErrorJSON(tool, "prompt must be at most 5000 characters")
 	}
 	apiKey := strings.TrimSpace(s.settingValue("image_tool_api_key"))
 	if apiKey == "" {
-		return imageToolErrorJSON("image_generate", "image_tool_api_key must be configured")
+		return imageToolErrorJSON(tool, "image_tool_api_key must be configured")
 	}
-	mode := s.imageToolMode()
 	model := normalizeImageModel(args.Model, s.imageGenerateModel())
 	if mode == imageToolModeResponses {
 		model = s.imageResponsesModel()
@@ -248,10 +335,10 @@ func (s *Server) executeImageGenerateToolWithContext(arguments string, toolCtx r
 	n := clampImageCount(args.N)
 	references, err := s.normalizeImageGenerateReferences(args.Image, toolCtx.UserID, toolCtx.PublicBaseURL)
 	if err != nil {
-		return imageToolErrorJSON("image_generate", err.Error())
+		return imageToolErrorJSON(tool, err.Error())
 	}
 	request := imageGenerationRequest{
-		Tool:           "image_generate",
+		Tool:           tool,
 		Mode:           mode,
 		Model:          model,
 		Prompt:         prompt,
@@ -267,21 +354,21 @@ func (s *Server) executeImageGenerateToolWithContext(arguments string, toolCtx r
 	case imageToolModeResponses:
 		body, err := s.runResponsesImageGeneration(apiKey, request)
 		if err != nil {
-			return imageToolErrorJSON("image_generate", err.Error())
+			return imageToolErrorJSON(tool, err.Error())
 		}
-		return s.normalizeGeneratedImageResponseWithContext("image_generate", body, toolCtx)
+		return s.normalizeGeneratedImageResponseWithContext(tool, body, toolCtx)
 	case imageToolModeChatCompletions:
 		body, err := s.runChatCompletionsImageGeneration(apiKey, request)
 		if err != nil {
-			return imageToolErrorJSON("image_generate", err.Error())
+			return imageToolErrorJSON(tool, err.Error())
 		}
-		return s.normalizeGeneratedImageResponseWithContext("image_generate", body, toolCtx)
+		return s.normalizeGeneratedImageResponseWithContext(tool, body, toolCtx)
 	default:
 		body, err := s.runImageAPIImageGeneration(apiKey, request)
 		if err != nil {
-			return imageToolErrorJSON("image_generate", err.Error())
+			return imageToolErrorJSON(tool, err.Error())
 		}
-		return s.normalizeGeneratedImageResponseWithContext("image_generate", body, toolCtx)
+		return s.normalizeGeneratedImageResponseWithContext(tool, body, toolCtx)
 	}
 }
 
@@ -313,48 +400,9 @@ func (s *Server) executeImageEditTool(call responseToolCall, toolCtx responseToo
 	if apiKey == "" {
 		return imageToolErrorJSON("image_edit", "image_tool_api_key must be configured")
 	}
-	mode := s.imageToolMode()
 	imageAttachment, attachments, err := s.resolveImageEditAttachment(toolCtx.ConversationID, toolCtx.UserID, strings.TrimSpace(firstNonEmpty(args.ImagePath, args.WorkspacePath)), args.ImageIndex)
 	if err != nil {
 		return imageToolErrorJSON("image_edit", err.Error())
-	}
-	if mode != imageToolModeImageAPI {
-		if strings.TrimSpace(args.MaskPath) != "" || args.MaskIndex != nil {
-			return imageToolErrorJSON("image_edit", "mask-based image_edit is only available in Image API mode")
-		}
-		reference, err := s.normalizeImageEditReference(imageAttachment, toolCtx.UserID, toolCtx.PublicBaseURL)
-		if err != nil {
-			return imageToolErrorJSON("image_edit", err.Error())
-		}
-		model := s.imageResponsesModel()
-		if mode == imageToolModeChatCompletions {
-			model = s.imageChatModel()
-		}
-		request := imageGenerationRequest{
-			Tool:           "image_edit",
-			Mode:           mode,
-			Model:          model,
-			Prompt:         prompt,
-			References:     []string{reference},
-			Size:           normalizeImageGenerateSize(args.Size, s.imageGenerateSize()),
-			ResponseFormat: normalizeImageResponseFormat(args.ResponseFormat, s.imageResponseFormat()),
-			Quality:        s.imageQuality(),
-			N:              clampImageCount(args.N),
-			User:           args.User,
-			Action:         "edit",
-		}
-		if mode == imageToolModeResponses {
-			body, err := s.runResponsesImageGeneration(apiKey, request)
-			if err != nil {
-				return imageToolErrorJSON("image_edit", err.Error())
-			}
-			return s.normalizeGeneratedImageResponseWithContext("image_edit", body, toolCtx)
-		}
-		body, err := s.runChatCompletionsImageGeneration(apiKey, request)
-		if err != nil {
-			return imageToolErrorJSON("image_edit", err.Error())
-		}
-		return s.normalizeGeneratedImageResponseWithContext("image_edit", body, toolCtx)
 	}
 	imageFile, err := decodeAttachmentPNG(imageAttachment, "image", s.workspaceRoot())
 	if err != nil {
@@ -490,10 +538,10 @@ func (s *Server) runResponsesImageGeneration(apiKey string, request imageGenerat
 
 func (s *Server) runChatCompletionsImageGeneration(apiKey string, request imageGenerationRequest) ([]byte, error) {
 	text := request.Prompt
-	if request.Tool == "image_edit" || request.Action == "edit" {
-		text = "Edit or regenerate the provided image according to this instruction. Return the generated image as a URL or base64 image only if your API supports image output.\n\n" + request.Prompt
+	if request.Tool == imageToolNameEdit || request.Action == "edit" {
+		text = "Edit or regenerate the provided image according to this instruction. Return the generated image as an image URL only if your API supports image output. Do not return base64.\n\n" + request.Prompt
 	} else {
-		text = "Generate an image from this instruction. Return the generated image as a URL or base64 image only if your API supports image output.\n\n" + request.Prompt
+		text = "Generate an image from this instruction. Return the generated image as an image URL only if your API supports image output. Do not return base64.\n\n" + request.Prompt
 	}
 	content := []map[string]interface{}{
 		{"type": "text", "text": text},
@@ -971,7 +1019,7 @@ func isWorkspacePathForUser(path string, userID int64) bool {
 
 func (s *Server) normalizeGeneratedImageResponseWithContext(tool string, body []byte, toolCtx responseToolContext) string {
 	return normalizeGeneratedImageResponsePostprocess(tool, body, func(images []imageToolResultImage) []imageToolResultImage {
-		return s.persistInlineImageResults(tool, images, toolCtx)
+		return s.persistGeneratedImageResults(tool, images, toolCtx)
 	})
 }
 
@@ -1137,14 +1185,11 @@ func looksLikeChatCompletionResponse(body []byte) bool {
 	return len(raw.Choices) > 0
 }
 
-func (s *Server) persistInlineImageResults(tool string, images []imageToolResultImage, toolCtx responseToolContext) []imageToolResultImage {
-	if toolCtx.UserID <= 0 || s == nil {
-		return images
-	}
+func (s *Server) persistGeneratedImageResults(tool string, images []imageToolResultImage, toolCtx responseToolContext) []imageToolResultImage {
 	next := make([]imageToolResultImage, 0, len(images))
 	for index, image := range images {
 		item := image
-		if strings.TrimSpace(item.WorkspacePath) == "" {
+		if toolCtx.UserID > 0 && s != nil && strings.TrimSpace(item.WorkspacePath) == "" {
 			data, ext, err := imageResultBytes(item)
 			if err == nil && len(data) > 0 {
 				if relPath, err := s.saveGeneratedImageToWorkspace(toolCtx.UserID, tool, index, data, ext); err == nil {
@@ -1155,9 +1200,7 @@ func (s *Server) persistInlineImageResults(tool string, images []imageToolResult
 				}
 			}
 		}
-		if strings.TrimSpace(item.WorkspacePath) != "" {
-			item.B64JSON = ""
-		}
+		item.B64JSON = ""
 		next = append(next, item)
 	}
 	return next
@@ -1401,7 +1444,7 @@ func (s *Server) normalizeImageEditReference(item attachment, userID int64, publ
 	}
 	content := strings.TrimSpace(item.Content)
 	if strings.HasPrefix(strings.ToLower(content), "data:") {
-		return content, nil
+		return s.persistInlineImageReference(content, item.Name, userID, publicBaseURL)
 	}
 	data, err := decodeDataURLOrBase64(content)
 	if err != nil {
@@ -1417,7 +1460,43 @@ func (s *Server) normalizeImageEditReference(item attachment, userID int64, publ
 	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
 		mimeType = "image/png"
 	}
-	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data)), nil
+	return s.persistInlineImageReference(fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data)), item.Name, userID, publicBaseURL)
+}
+
+func (s *Server) persistInlineImageReference(content, name string, userID int64, publicBaseURL string) (string, error) {
+	if s == nil || userID <= 0 {
+		return "", fmt.Errorf("inline image reference must be stored before it can be used")
+	}
+	data, mimeType, ok, err := decodeImageDataURL(strings.TrimSpace(content))
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		data, err = decodeDataURLOrBase64(content)
+		if err != nil {
+			return "", err
+		}
+		mimeType = "image/png"
+	}
+	if len(data) > maxImageReferenceBytes {
+		return "", fmt.Errorf("inline image reference must be smaller than 8MB")
+	}
+	ext := imageExtensionForMIME(mimeType)
+	if ext == ".png" && strings.TrimSpace(name) != "" {
+		if candidate := filepath.Ext(strings.TrimSpace(name)); candidate != "" {
+			ext = candidate
+		}
+	}
+	switch strings.ToLower(ext) {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif":
+	default:
+		ext = ".png"
+	}
+	relPath, err := s.saveGeneratedImageToWorkspace(userID, "image-reference", 0, data, ext)
+	if err != nil {
+		return "", err
+	}
+	return s.publicWorkspaceFileURL(relPath, userID, publicBaseURL, 30*time.Minute)
 }
 
 func shouldSendImageGenerateStyle(model, style string) bool {
@@ -1599,7 +1678,7 @@ func normalizeImageResponseFormat(value, fallback string) string {
 		value = strings.TrimSpace(fallback)
 	}
 	switch value {
-	case "url", "b64_json":
+	case "url":
 		return value
 	default:
 		return defaultImageToolResponseFormat

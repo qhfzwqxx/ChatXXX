@@ -9,7 +9,7 @@ import (
 
 const defaultWebSearchCardResultCount = 4
 const (
-	defaultImageToolMode           = imageToolModeImageAPI
+	defaultImageToolMode           = imageToolModeResponses
 	defaultImageToolBaseURL        = "https://api.tu-zi.com"
 	defaultImageGenerateModel      = "gpt-image-2"
 	defaultImageEditModel          = "gpt-image-1.5"
@@ -87,7 +87,7 @@ func (s *Server) handleAdminGetSettings(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	if strings.TrimSpace(values["search_tool_mode"].Value) == "" {
-		values["search_tool_mode"] = appSetting{Key: "search_tool_mode", Value: searchToolModeUniFuncs}
+		values["search_tool_mode"] = appSetting{Key: "search_tool_mode", Value: searchToolModeSearching}
 	}
 	defaults := map[string]string{
 		"image_tool_mode":       defaultImageToolMode,
@@ -214,8 +214,10 @@ func normalizeSearchToolMode(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case searchToolModeSearching:
 		return searchToolModeSearching
-	default:
+	case searchToolModeUniFuncs:
 		return searchToolModeUniFuncs
+	default:
+		return searchToolModeSearching
 	}
 }
 

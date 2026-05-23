@@ -41,7 +41,7 @@ const responsesStreamReconnectRetryInstruction = "The previous streamed assistan
 
 const responsesBaseToolInstruction = "You have local tools available in this chat runtime. Do not say you lack tools when the user asks for current web information or asks you to use an available tool; call the appropriate tool instead.\n\n" + runtimeSystemToolPrinciple + "\n\n" + responsesToolPacingInstruction
 
-const responsesWorkspaceToolInstruction = "\n\nWorkspace files: user uploads are stored in a per-user workspace. User messages may list workspace file names, paths, MIME type, size, and dimensions. Image tool routing rules:\n1. Use image_generate for text-to-image and image-to-image/reference generation. This includes: 图生图, 以这张图为参考生成, 以这张图为基础生成, 参考这张图重新画, 按这张图的构图/主体/姿势生成, 换风格生成, 风格化, generate from this image, use this image as reference, style transfer. Put the workspace path or generated image URL in the image argument.\n2. Use image_edit only when the user explicitly provides or asks to use a mask/mask image/mask_index/mask_path. If no mask is provided or requested, do not call image_edit; use image_generate instead, even when the user says edit/change/modify an image.\n3. If the user gives an uploaded image or a previously generated image URL but asks for a new image based on it, choose image_generate, not image_edit. image_edit is not the general uploaded-image tool.\nDo not ask the user to paste base64 image data.\n\nGenerated-image display rule: image_generate and image_edit results are already displayed to the user in dedicated image tool cards by the chat UI. After these tools return images, do not repeat the generated images in the assistant text with Markdown image syntax, HTML img tags, raw base64, or duplicate image URLs. You may still write ordinary text around the result if it is useful."
+const responsesWorkspaceToolInstruction = "\n\nWorkspace files: user uploads are stored in a per-user workspace. User messages may list workspace file names, paths, MIME type, size, and dimensions. Image tool routing rules:\n1. In Responses image mode, the only image tool is response_image. Use it for text-to-image and image-to-image/reference generation.\n2. In Chat Completions image mode, the only image tool is chat_image. Use it for text-to-image and image-to-image/reference generation.\n3. In Image API mode, image_generate creates images and reference-based image-to-image generations; image_edit is only for explicit mask/mask image/mask_index/mask_path edits.\n4. For 图生图, 以这张图为参考生成, 以这张图为基础生成, 参考这张图重新画, 按这张图的构图/主体/姿势生成, 换风格生成, 风格化, generate from this image, use this image as reference, or style transfer, pass a URL or workspace path in the image argument of the available generation tool.\n5. Never ask the user to paste base64 image data and never put base64 in image tool arguments.\n\nGenerated-image display rule: image tool results are already displayed to the user in dedicated image tool cards by the chat UI. After an image tool returns images, do not repeat the generated images in the assistant text with Markdown image syntax, HTML img tags, raw base64, or duplicate image URLs. You may still write ordinary text around the result if it is useful."
 
 const responsesUniFuncsToolInstruction = responsesBaseToolInstruction + responsesWorkspaceToolInstruction + "\n\nCurrent web tool mode: UniFuncs. Available web tools are web_search and web_reader. The searching tool is not available in this mode.\n\nFor web_search, infer the user's real intent before calling the tool. If the wording is misspelled, transliterated, abbreviated, or mixed-language, resolve it to the most likely real-world person, place, event, product, or topic in your own reasoning, then search that intended target. Do not mechanically copy the user's raw text into the query. Ask for clarification only when multiple interpretations are equally plausible or the target cannot be inferred with reasonable confidence.\n\nFor web_reader, call it when there is a concrete URL to read, including URLs returned by web_search. Prefer format=markdown unless plain text is specifically better.\n\nFor web/current/research questions, prefer the combined workflow whenever useful: first call web_search to discover candidate pages, then call web_reader on the most relevant 1 to 3 result URLs before giving the final answer. Use this search-then-read workflow especially for news, recent facts, product/company/person details, documentation lookups, and any answer that benefits from page-level evidence."
 
@@ -555,7 +555,7 @@ func generatedImagePromptText(raw string) string {
 	refs := make([]generatedImageRef, 0)
 	seen := map[string]bool{}
 	for _, step := range metadata.ToolSteps {
-		if step.Status != "completed" || (step.Name != "image_generate" && step.Name != "image_edit") {
+		if step.Status != "completed" || !isImageToolName(step.Name) {
 			continue
 		}
 		var output imageToolResult
@@ -577,7 +577,7 @@ func generatedImagePromptText(raw string) string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("此前由图片工具生成的图片 URL，可作为后续 image_generate 的 image 参数使用：")
+	b.WriteString("此前由图片工具生成的图片 URL，可作为后续图片工具的 image 参数使用：")
 	for index, ref := range refs {
 		if index >= 8 {
 			break
@@ -744,15 +744,16 @@ func (s *Server) streamChatCompletions(ctx context.Context, w http.ResponseWrite
 func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, conversationID, userID int64, latest, memoryInstruction, workspaceInstruction, publicBaseURL string, toolSteps *[]responseToolStep, persist streamPersistFunc, persistToolMetadata func([]responseToolStep), shouldStop func() bool) (string, error) {
 	messages, _ := s.listMessages(conversationID, userID)
 	input := buildResponsesInput(messages, latest)
-	mode := s.searchToolMode()
-	tools := responseToolDefinitions(mode)
+	searchMode := s.searchToolMode()
+	imageMode := s.imageToolMode()
+	tools := responseToolDefinitionsForImageMode(searchMode, imageMode)
 	toolCtx := responseToolContext{Context: ctx, ConversationID: conversationID, UserID: userID, PublicBaseURL: publicBaseURL}
 	var full strings.Builder
 	needTextBeforeTool := false
 	retriedStreamDisconnect := false
 	for round := 0; round < maxResponsesToolRounds; round++ {
 		persistRound := prefixedPersist(full.String(), persist)
-		result, err := s.readResponsesRound(ctx, w, provider, conversation, memoryInstruction, workspaceInstruction, input, tools, mode, persistRound, shouldStop)
+		result, err := s.readResponsesRound(ctx, w, provider, conversation, memoryInstruction, workspaceInstruction, input, tools, searchMode, persistRound, shouldStop)
 		textAlreadyAppended := false
 		if err != nil {
 			hasToolCall := len(result.ToolCalls) > 0
@@ -813,7 +814,7 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, pro
 		sendToolStep(w, running)
 		appendToolStep(toolSteps, running)
 		persistToolMetadataSnapshot(toolSteps, persistToolMetadata)
-		output := s.executeResponseToolWithContext(call, mode, toolCtx)
+		output := s.executeResponseToolWithContext(call, searchMode, toolCtx)
 		if streamShouldStop(ctx, shouldStop) {
 			return full.String(), errGenerationStopped
 		}
@@ -841,7 +842,7 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, pro
 }
 
 func toolOutputForModel(toolName, output string) string {
-	if toolName != "image_generate" && toolName != "image_edit" {
+	if !isImageToolName(toolName) {
 		return output
 	}
 	var payload imageToolResult
@@ -875,7 +876,11 @@ func toolOutputForModel(toolName, output string) string {
 		urlValue := strings.TrimSpace(image.URL)
 		pathValue := strings.TrimSpace(image.WorkspacePath)
 		if pathValue != "" {
-			result.Images = append(result.Images, modelImage{WorkspacePath: pathValue})
+			item := modelImage{WorkspacePath: pathValue}
+			if urlValue != "" && !strings.HasPrefix(strings.ToLower(urlValue), "data:image/") {
+				item.URL = urlValue
+			}
+			result.Images = append(result.Images, item)
 			if strings.TrimSpace(image.B64JSON) != "" {
 				omitted++
 			}
@@ -1056,6 +1061,10 @@ func buildResponsesInput(messages []Message, latest string) []interface{} {
 }
 
 func responseToolDefinitions(mode string) []map[string]interface{} {
+	return responseToolDefinitionsForImageMode(mode, defaultImageToolMode)
+}
+
+func responseToolDefinitionsForImageMode(mode, imageMode string) []map[string]interface{} {
 	tools := []map[string]interface{}{
 		{
 			"type":        "function",
@@ -1074,7 +1083,7 @@ func responseToolDefinitions(mode string) []map[string]interface{} {
 			},
 		},
 	}
-	tools = append(tools, imageToolDefinitions()...)
+	tools = append(tools, imageToolDefinitions(imageMode)...)
 	if normalizeSearchToolMode(mode) == searchToolModeSearching {
 		return append(tools, map[string]interface{}{
 			"type":        "function",
@@ -1527,7 +1536,7 @@ func persistToolMetadataSnapshot(steps *[]responseToolStep, persist func([]respo
 }
 
 func isSuccessfulImageToolOutput(name, output string) bool {
-	if name != "image_generate" && name != "image_edit" {
+	if !isImageToolName(name) {
 		return false
 	}
 	var payload struct {
@@ -1582,7 +1591,7 @@ func sanitizeToolStepsForMetadata(steps []responseToolStep) []responseToolStep {
 	next := make([]responseToolStep, len(steps))
 	for i, step := range steps {
 		next[i] = step
-		if (step.Name == "image_generate" || step.Name == "image_edit") && step.Output != "" {
+		if isImageToolName(step.Name) && step.Output != "" {
 			if output, changed := sanitizeImageToolOutputString(step.Output); changed {
 				next[i].Output = output
 			}
@@ -1610,7 +1619,7 @@ func sanitizeMessageMetadataForClient(raw string) string {
 			continue
 		}
 		name, _ := step["name"].(string)
-		if name != "image_generate" && name != "image_edit" {
+		if !isImageToolName(name) {
 			continue
 		}
 		output, _ := step["output"].(string)
@@ -1684,9 +1693,25 @@ func (s *Server) executeResponseToolWithContext(call responseToolCall, mode stri
 	switch strings.TrimSpace(call.Name) {
 	case "get_current_time":
 		return executeGetCurrentTimeTool(call.Arguments)
+	case imageToolNameResponseImage:
+		if s.imageToolMode() != imageToolModeResponses {
+			return disabledToolJSON(imageToolNameResponseImage, "response_image is disabled because Responses image mode is not active")
+		}
+		return s.executeResponseImageTool(call.Arguments, toolCtx)
+	case imageToolNameChatImage:
+		if s.imageToolMode() != imageToolModeChatCompletions {
+			return disabledToolJSON(imageToolNameChatImage, "chat_image is disabled because Chat Completions image mode is not active")
+		}
+		return s.executeChatImageTool(call.Arguments, toolCtx)
 	case "image_generate":
+		if s.imageToolMode() != imageToolModeImageAPI {
+			return disabledToolJSON(imageToolNameGenerate, "image_generate is disabled because Image API mode is not active")
+		}
 		return s.executeImageGenerateToolWithContext(call.Arguments, toolCtx)
 	case "image_edit":
+		if s.imageToolMode() != imageToolModeImageAPI {
+			return disabledToolJSON(imageToolNameEdit, "image_edit is disabled because Image API mode is not active")
+		}
 		return s.executeImageEditTool(call, toolCtx)
 	case "web_search":
 		if toolMode != searchToolModeUniFuncs {

@@ -2535,6 +2535,10 @@ textarea {
 }
 
 .tool-mode-switch__item {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   min-width: 0;
   min-height: 32px;
   border: 0;
@@ -2545,6 +2549,18 @@ textarea {
   font-size: 13px;
   font-weight: 600;
   white-space: nowrap;
+}
+
+.tool-mode-switch__item span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  border-radius: 999px;
+  background: rgba(16, 185, 129, 0.11);
+  color: #047857;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .tool-mode-switch__item.active {
@@ -2954,6 +2970,53 @@ textarea {
   gap: 16px;
 }
 
+.admin-tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  width: 100%;
+  max-width: 1060px;
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.admin-tool-card {
+  align-content: start;
+  max-width: none;
+  margin: 0;
+}
+
+.admin-tool-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.admin-tool-meta > div {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-soft);
+  padding: 10px 11px;
+}
+
+.admin-tool-meta span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.admin-tool-meta strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .admin-status-grid,
 .admin-placeholder-grid {
   display: grid;
@@ -3325,6 +3388,49 @@ textarea {
   .admin-summary-list--four,
   .admin-field-grid {
     grid-template-columns: 1fr;
+  }
+
+  .admin-tool-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+    width: 100%;
+    max-width: 680px;
+    margin-right: auto;
+    margin-left: auto;
+  }
+
+  .admin-tool-card {
+    gap: 10px;
+    border-radius: 12px;
+    padding: 12px;
+  }
+
+  .admin-tool-card .provider-form-head {
+    gap: 10px;
+  }
+
+  .admin-tool-card .provider-form-head p {
+    display: none;
+  }
+
+  .admin-tool-card .primary-btn {
+    min-height: 38px;
+    width: 100%;
+    padding: 0 8px;
+    font-size: 13px;
+  }
+
+  .admin-tool-meta {
+    grid-template-columns: 1fr;
+    gap: 7px;
+  }
+
+  .admin-tool-meta > div {
+    padding: 8px;
+  }
+
+  .admin-tool-meta > div:nth-child(n + 3) {
+    display: none;
   }
 
   .admin-status-card,

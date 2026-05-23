@@ -12,7 +12,6 @@ import {
   Copy,
   Download,
   Edit3,
-  LayoutDashboard,
   LogOut,
   Menu,
   Plus,
@@ -103,10 +102,10 @@ type AdminSettings = {
   embedding_top_k: string;
 };
 
-type AdminTab = 'overview' | 'models' | 'tools' | 'memory' | 'runtime';
+type AdminTab = 'models' | 'tools' | 'memory' | 'runtime';
 
 const emptyAdminSettings: AdminSettings = {
-  search_tool_mode: 'unifuncs',
+  search_tool_mode: 'searching',
   unifuncs_api_key: '',
   unifuncs_base_url: '',
   web_search_card_result_count: '4',
@@ -114,7 +113,7 @@ const emptyAdminSettings: AdminSettings = {
   searching_api_key: '',
   searching_model: '',
   searching_api_id: '',
-  image_tool_mode: 'image_api',
+  image_tool_mode: 'responses',
   image_tool_base_url: 'https://api.tu-zi.com',
   image_tool_api_key: '',
   image_generate_model: 'gpt-image-2',
@@ -174,7 +173,7 @@ type ImageToolOutput = {
   ok?: boolean;
   tool?: string;
   created?: number;
-  images?: Array<{ url?: string; b64_json?: string; workspace_path?: string }>;
+  images?: Array<{ url?: string; workspace_path?: string }>;
   error?: string;
 };
 
@@ -2006,7 +2005,7 @@ function ToolTimeline({ steps, webSearchCardResultCount }: { steps: ToolStep[]; 
         if (step.name === 'web_search') {
           return <WebSearchToolCard key={key} step={step} status={status} resultCount={webSearchCardResultCount} />;
         }
-        if (step.name === 'image_generate' || step.name === 'image_edit') {
+        if (isImageToolStep(step.name)) {
           return <ImageToolCard key={key} step={step} status={status} />;
         }
         return (
@@ -2035,8 +2034,9 @@ function ImageToolCard({ step, status }: { step: ToolStep; status: { kind: strin
   const [now, setNow] = useState(() => Date.now());
   const output = parseImageToolOutput(step.output);
   const images = output?.images?.map(imageToolSource).filter(Boolean) as string[] || [];
-  const title = step.name === 'image_edit' ? '图片编辑' : '图片生成';
-  const runningText = step.name === 'image_edit' ? '正在编辑图片' : '正在生成图片';
+  const isEditTool = step.name === 'image_edit';
+  const title = isEditTool ? '图片编辑' : '图片生成';
+  const runningText = isEditTool ? '正在编辑图片' : '正在生成图片';
   const error = output?.error || (status.kind === 'error' ? '图片工具调用失败' : '');
   useEffect(() => {
     if (status.kind !== 'running') return;
@@ -2094,10 +2094,9 @@ function isStepOlderThan(step: ToolStep, thresholdMs: number, now = Date.now()) 
   return now - startedAt >= thresholdMs;
 }
 
-function imageToolSource(item: { url?: string; b64_json?: string; workspace_path?: string }) {
+function imageToolSource(item: { url?: string; workspace_path?: string }) {
   if (item.url) return item.url;
   if (item.workspace_path) return `/api/workspace/files/${item.workspace_path}`;
-  if (item.b64_json) return item.b64_json.startsWith('data:') ? item.b64_json : `data:image/png;base64,${item.b64_json}`;
   return '';
 }
 
@@ -2246,12 +2245,11 @@ function parseImageToolOutput(value?: string): ImageToolOutput | null {
       if (!entry || typeof entry !== 'object') return null;
       const image = entry as Record<string, unknown>;
       const url = typeof image.url === 'string' ? image.url : '';
-      const b64 = typeof image.b64_json === 'string' ? image.b64_json : '';
       const workspacePath = typeof image.workspace_path === 'string' ? image.workspace_path : '';
-      if (!url && !b64 && !workspacePath) return null;
-      return { url, b64_json: b64, workspace_path: workspacePath };
+      if (!url && !workspacePath) return null;
+      return { url, workspace_path: workspacePath };
     })
-    .filter((entry): entry is { url: string; b64_json: string; workspace_path: string } => !!entry);
+    .filter((entry): entry is { url: string; workspace_path: string } => !!entry);
   return {
     ok: typeof item.ok === 'boolean' ? item.ok : undefined,
     tool: typeof item.tool === 'string' ? item.tool : undefined,
@@ -2371,7 +2369,15 @@ function toolDisplayName(name: string) {
   if (name === 'web_search') return '搜索网页';
   if (name === 'web_reader') return '浏览网页';
   if (name === 'searching') return '联网搜索';
+  if (name === 'response_image') return 'Responses 生图';
+  if (name === 'chat_image') return 'Chat 生图';
+  if (name === 'image_generate') return 'Image API 生图';
+  if (name === 'image_edit') return 'Image API 编辑';
   return name.replace(/_/g, ' ');
+}
+
+function isImageToolStep(name: string) {
+  return name === 'response_image' || name === 'chat_image' || name === 'image_generate' || name === 'image_edit';
 }
 
 function toolStepStatus(step: ToolStep) {
@@ -2408,7 +2414,7 @@ function toolStepSummary(step: ToolStep) {
     if (query) return `联网搜索 ${query}`;
     return '准备联网搜索';
   }
-  if (step.name === 'image_generate') {
+  if (step.name === 'response_image' || step.name === 'chat_image' || step.name === 'image_generate') {
     const prompt = jsonStringField(args, 'prompt');
     if (prompt) return `生成图片：${prompt}`;
     return '准备生成图片';
@@ -2894,7 +2900,7 @@ function ForbiddenScreen() {
 function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }) {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [adminSettings, setAdminSettings] = useState<AdminSettings>(emptyAdminSettings);
-  const [activeTab, setActiveTab] = useState<AdminTab>('overview');
+  const [activeTab, setActiveTab] = useState<AdminTab>('models');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   async function refreshProviders() {
@@ -2906,7 +2912,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
     const res = await api.adminSettings();
     const settings = res.settings || {};
     setAdminSettings({
-      search_tool_mode: settings.search_tool_mode?.value || 'unifuncs',
+      search_tool_mode: settings.search_tool_mode?.value || 'searching',
       unifuncs_api_key: settings.unifuncs_api_key?.value || '',
       unifuncs_base_url: settings.unifuncs_base_url?.value || '',
       web_search_card_result_count: settings.web_search_card_result_count?.value || '4',
@@ -2914,7 +2920,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
       searching_api_key: settings.searching_api_key?.value || '',
       searching_model: settings.searching_model?.value || '',
       searching_api_id: settings.searching_api_id?.value || '',
-      image_tool_mode: settings.image_tool_mode?.value || 'image_api',
+      image_tool_mode: settings.image_tool_mode?.value || 'responses',
       image_tool_base_url: settings.image_tool_base_url?.value || 'https://api.tu-zi.com',
       image_tool_api_key: settings.image_tool_api_key?.value || '',
       image_generate_model: settings.image_generate_model?.value || 'gpt-image-2',
@@ -2940,8 +2946,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
     void refreshSettings();
   }, []);
 
-  const activeTabTitle =
-    activeTab === 'overview' ? '概览' : activeTab === 'models' ? '模型' : activeTab === 'tools' ? '工具' : activeTab === 'memory' ? '记忆' : '运行';
+  const activeTabTitle = activeTab === 'models' ? '对话' : activeTab === 'tools' ? '工具' : activeTab === 'memory' ? '记忆' : '运行';
 
   function selectTab(tab: AdminTab) {
     setActiveTab(tab);
@@ -2965,13 +2970,9 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
           </button>
         </div>
         <nav className="admin-nav" aria-label="后台分类">
-          <button className={'admin-nav-item ' + (activeTab === 'overview' ? 'active' : '')} type="button" onClick={() => selectTab('overview')}>
-            <LayoutDashboard size={16} />
-            概览
-          </button>
           <button className={'admin-nav-item ' + (activeTab === 'models' ? 'active' : '')} type="button" onClick={() => selectTab('models')}>
             <Settings size={16} />
-            模型
+            对话
           </button>
           <button className={'admin-nav-item ' + (activeTab === 'tools' ? 'active' : '')} type="button" onClick={() => selectTab('tools')}>
             <Wrench size={16} />
@@ -3002,9 +3003,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
           <h1>后台管理</h1>
           <p>/admin</p>
         </header>
-        {activeTab === 'overview' ? (
-          <OverviewPanel providers={providers} settings={adminSettings} onNavigate={setActiveTab} />
-        ) : activeTab === 'models' ? (
+        {activeTab === 'models' ? (
           <ProviderPanel providers={providers} settings={adminSettings} onSettingsChanged={refreshSettings} onChanged={refreshProviders} />
         ) : activeTab === 'tools' ? (
           <UniFuncsPanel settings={adminSettings} onChanged={refreshSettings} />
@@ -3015,77 +3014,6 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
         )}
       </section>
     </main>
-  );
-}
-
-function OverviewPanel({ providers, settings, onNavigate }: { providers: Provider[]; settings: AdminSettings; onNavigate: (tab: AdminTab) => void }) {
-  const activeProviders = providers.filter((provider) => provider.is_active);
-  const visibleProviders = providers.filter((provider) => provider.is_visible);
-  const defaultProvider = providers.find((provider) => provider.is_default);
-  const titleProvider = providers.find((provider) => String(provider.id) === settings.title_provider_id);
-  const memoryProvider = providers.find((provider) => String(provider.id) === settings.memory_provider_id);
-  const embeddingProvider = providers.find((provider) => String(provider.id) === settings.embedding_provider_id);
-  const toolMode = settings.search_tool_mode === 'searching' ? 'Searching LLM' : 'UniFuncs';
-
-  return (
-    <div className="admin-panel">
-      <section className="admin-section-card admin-overview-hero">
-        <div className="provider-form-head">
-          <div>
-            <h2>系统概览</h2>
-            <p>快速确认模型、工具、记忆和运行模块是否已经处在可用状态。</p>
-          </div>
-        </div>
-        <div className="admin-status-grid">
-          <button className="admin-status-card" type="button" onClick={() => onNavigate('models')}>
-            <span>模型</span>
-            <strong>{activeProviders.length ? `${activeProviders.length} 个启用` : '未启用'}</strong>
-            <small>{visibleProviders.length ? `${visibleProviders.length} 个前台可见` : '暂无前台可见模型'}</small>
-          </button>
-          <button className="admin-status-card" type="button" onClick={() => onNavigate('tools')}>
-            <span>工具</span>
-            <strong>{toolMode}</strong>
-            <small>{settings.search_tool_mode === 'searching' ? '当前使用 searching 工具' : '当前使用 web_search / web_reader'}</small>
-          </button>
-          <button className="admin-status-card" type="button" onClick={() => onNavigate('memory')}>
-            <span>记忆</span>
-            <strong>{memoryProvider && embeddingProvider ? '可用' : '未完整配置'}</strong>
-            <small>{memoryProvider ? `LLM ${memoryProvider.name}` : '未配置记忆 LLM'}</small>
-          </button>
-          <button className="admin-status-card" type="button" onClick={() => onNavigate('runtime')}>
-            <span>运行</span>
-            <strong>待接入</strong>
-            <small>后续放统计、日志、成本和错误率</small>
-          </button>
-        </div>
-      </section>
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>关键配置</h2>
-            <p>这里展示当前会直接影响前台对话体验的配置。</p>
-          </div>
-        </div>
-        <div className="admin-summary-list">
-          <div>
-            <span>默认模型</span>
-            <strong>{defaultProvider ? `${defaultProvider.name} · ${defaultProvider.model}` : '未设置'}</strong>
-          </div>
-          <div>
-            <span>对话标题 LLM</span>
-            <strong>{titleProvider ? `${titleProvider.name} · ${titleProvider.model}` : '未配置'}</strong>
-          </div>
-          <div>
-            <span>向量化 LLM</span>
-            <strong>{embeddingProvider ? `${embeddingProvider.name} · ${embeddingProvider.model}` : '未配置'}</strong>
-          </div>
-          <div>
-            <span>搜索卡片条数</span>
-            <strong>{settings.web_search_card_result_count || '4'} 条</strong>
-          </div>
-        </div>
-      </section>
-    </div>
   );
 }
 
@@ -3136,7 +3064,9 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
     event.preventDefault();
     setError('');
     try {
-      await api.updateAdminSettings(form);
+      const nextForm = { ...form, searching_api_id: '' };
+      setForm(nextForm);
+      await api.updateAdminSettings(nextForm);
       await onChanged();
       onDone?.();
     } catch (err) {
@@ -3145,10 +3075,11 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
   }
 
   async function saveForm(nextForm: AdminSettings) {
-    setForm(nextForm);
+    const cleanForm = { ...nextForm, searching_api_id: '' };
+    setForm(cleanForm);
     setError('');
     try {
-      await api.updateAdminSettings(nextForm);
+      await api.updateAdminSettings(cleanForm);
       await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');
@@ -3170,102 +3101,67 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
 
   return (
     <div className="admin-panel">
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>工具模式</h2>
-            <p>选择前台对话可以调用的搜索工具类型。</p>
-          </div>
-        </div>
-        <div className="tool-mode-switch" role="group" aria-label="搜索工具模式">
-          <button
-            className={'tool-mode-switch__item ' + (mode === 'unifuncs' ? 'active' : '')}
-            type="button"
-            onClick={() => void saveForm({ ...form, search_tool_mode: 'unifuncs' })}
-          >
-            UniFuncs 联动
-          </button>
-          <button
-            className={'tool-mode-switch__item ' + (mode === 'searching' ? 'active' : '')}
-            type="button"
-            onClick={() => void saveForm({ ...form, search_tool_mode: 'searching' })}
-          >
-            Searching LLM
-          </button>
-        </div>
-      </section>
       {error && !searchModalOpen && !imageModalOpen && <div className="admin-error-banner">{error}</div>}
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>搜索工具配置</h2>
-            <p>当前对话工具只展示关键状态，完整密钥和参数通过弹窗维护。</p>
+      <div className="admin-tool-grid">
+        <section className="admin-section-card admin-tool-card">
+          <div className="provider-form-head">
+            <div>
+              <h2>搜索工具配置</h2>
+              <p>当前对话工具只展示关键状态，完整密钥和参数通过弹窗维护。</p>
+            </div>
+            <button className="primary-btn" type="button" onClick={() => { setError(''); setSearchModalOpen(true); }}>
+              <Settings size={16} />
+              设置
+            </button>
           </div>
-          <button className="primary-btn" type="button" onClick={() => { setError(''); setSearchModalOpen(true); }}>
-            <Settings size={16} />
-            配置搜索工具
-          </button>
-        </div>
-        <div className="admin-summary-list">
-          <div>
-            <span>当前模式</span>
-            <strong>{searchModeLabel}</strong>
+          <div className="admin-tool-meta">
+            <div>
+              <span>当前模式</span>
+              <strong>{searchModeLabel}</strong>
+            </div>
+            <div>
+              <span>模型 / 能力</span>
+              <strong>{searchModel}</strong>
+            </div>
+            <div>
+              <span>接口地址</span>
+              <strong>{searchEndpoint || '未填写 Base URL'}</strong>
+            </div>
+            {mode === 'unifuncs' && (
+              <div>
+                <span>搜索卡片</span>
+                <strong>{form.web_search_card_result_count || '4'} 条</strong>
+              </div>
+            )}
           </div>
-          <div>
-            <span>接口地址</span>
-            <strong>{searchEndpoint || '未填写 Base URL'}</strong>
+        </section>
+        <section className="admin-section-card admin-tool-card">
+          <div className="provider-form-head">
+            <div>
+              <h2>图片工具配置</h2>
+              <p>不同接口模式会启用不同图片工具，模型、尺寸和返回格式都在弹窗里维护。</p>
+            </div>
+            <button className="primary-btn" type="button" onClick={() => { setError(''); setImageModalOpen(true); }}>
+              <Settings size={16} />
+              设置
+            </button>
           </div>
-          <div>
-            <span>模型 / 能力</span>
-            <strong>{searchModel}</strong>
+          <div className="admin-tool-meta">
+            <div>
+              <span>调用模式</span>
+              <strong>{imageModeLabel}</strong>
+            </div>
+            <div>
+              <span>模型</span>
+              <strong>{imageModelLabel}</strong>
+            </div>
+            <div>
+              <span>接口地址</span>
+              <strong>{form.image_tool_base_url || '未填写 Base URL'}</strong>
+            </div>
           </div>
-          <div>
-            <span>搜索卡片</span>
-            <strong>{form.web_search_card_result_count || '4'} 条</strong>
-          </div>
-        </div>
-      </section>
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>图片工具配置</h2>
-            <p>image_generate 和 image_edit 的接口、模型、尺寸和返回格式都在弹窗里维护。</p>
-          </div>
-          <button className="primary-btn" type="button" onClick={() => { setError(''); setImageModalOpen(true); }}>
-            <Settings size={16} />
-            配置图片工具
-          </button>
-        </div>
-        <div className="admin-summary-list admin-summary-list--compact">
-          <div>
-            <span>调用模式</span>
-            <strong>{imageModeLabel}</strong>
-          </div>
-          <div>
-            <span>接口地址</span>
-            <strong>{form.image_tool_base_url || '未填写 Base URL'}</strong>
-          </div>
-          <div>
-            <span>模型</span>
-            <strong>{imageModelLabel}</strong>
-          </div>
-        </div>
-      </section>
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>后续工具能力</h2>
-            <p>后续新增的外部 API 工具、插件工具和能力开关都放在这里统一管理。</p>
-          </div>
-        </div>
-        <div className="provider-badges">
-          <span>web_search</span>
-          <span>web_reader</span>
-          <span>searching</span>
-          <span>image_generate</span>
-          <span>image_edit</span>
-        </div>
-      </section>
+        </section>
+      </div>
       {searchModalOpen && (
         <Modal title={mode === 'unifuncs' ? '配置 UniFuncs 工具' : '配置 Searching LLM'} onClose={() => setSearchModalOpen(false)} className="admin-modal-card">
           <form className="settings-grid admin-modal-form" onSubmit={(event) => void save(event, () => setSearchModalOpen(false))}>
@@ -3278,6 +3174,22 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
                     : '当前只启用 searching，web_search 和 web_reader 不可使用。'}
                 </p>
               </div>
+            </div>
+            <div className="tool-mode-switch" role="group" aria-label="搜索工具模式">
+              <button
+                className={'tool-mode-switch__item ' + (mode === 'searching' ? 'active' : '')}
+                type="button"
+                onClick={() => setForm({ ...form, search_tool_mode: 'searching' })}
+              >
+                Searching LLM <span>推荐</span>
+              </button>
+              <button
+                className={'tool-mode-switch__item ' + (mode === 'unifuncs' ? 'active' : '')}
+                type="button"
+                onClick={() => setForm({ ...form, search_tool_mode: 'unifuncs' })}
+              >
+                UniFuncs 联动
+              </button>
             </div>
             {mode === 'unifuncs' ? (
               <>
@@ -3322,11 +3234,6 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
                   value={form.searching_model}
                   onChange={(event) => setForm({ ...form, searching_model: event.target.value })}
                 />
-                <input
-                  placeholder="ID / API ID，可选"
-                  value={form.searching_api_id}
-                  onChange={(event) => setForm({ ...form, searching_api_id: event.target.value })}
-                />
                 <p className="field-help">切换回 UniFuncs 后，这套配置会保留，但 searching 不会被提供给模型。</p>
               </>
             )}
@@ -3349,23 +3256,23 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
             <div className="provider-form-head">
               <div>
                 <h2>图片工具</h2>
-                <p>配置主 LLM 可调用的 image_generate 和 image_edit。</p>
+                <p>选择图片接口模式，并配置对应工具的模型、尺寸和返回格式。</p>
               </div>
             </div>
             <div className="tool-mode-switch tool-mode-switch--three" role="group" aria-label="图片工具模式">
+              <button
+                className={'tool-mode-switch__item ' + (imageMode === 'responses' ? 'active' : '')}
+                type="button"
+                onClick={() => setForm({ ...form, image_tool_mode: 'responses' })}
+              >
+                Responses <span>推荐</span>
+              </button>
               <button
                 className={'tool-mode-switch__item ' + (imageMode === 'image_api' ? 'active' : '')}
                 type="button"
                 onClick={() => setForm({ ...form, image_tool_mode: 'image_api' })}
               >
                 Image API
-              </button>
-              <button
-                className={'tool-mode-switch__item ' + (imageMode === 'responses' ? 'active' : '')}
-                type="button"
-                onClick={() => setForm({ ...form, image_tool_mode: 'responses' })}
-              >
-                Responses
               </button>
               <button
                 className={'tool-mode-switch__item ' + (imageMode === 'chat_completions' ? 'active' : '')}
@@ -3378,8 +3285,8 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
             <label className="field-block image-mode-select">
               接口模式
               <select value={imageMode} onChange={(event) => setForm({ ...form, image_tool_mode: event.target.value })}>
+                <option value="responses">Responses（推荐）</option>
                 <option value="image_api">Image API</option>
-                <option value="responses">Responses</option>
                 <option value="chat_completions">Chat Completions</option>
               </select>
             </label>
@@ -3455,13 +3362,14 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
               </label>
               <label className="field-block">
                 返回格式
-                <select value={form.image_response_format} onChange={(event) => setForm({ ...form, image_response_format: event.target.value })}>
+                <select value="url" onChange={() => setForm({ ...form, image_response_format: 'url' })}>
                   <option value="url">url</option>
-                  <option value="b64_json">b64_json</option>
                 </select>
               </label>
             </div>
-            <p className="field-help">image_generate 和 image_edit 使用这里配置的独立图片接口。</p>
+            <p className="field-help">
+              Responses 模式只启用 response_image；Chat Completions 模式只启用 chat_image；Image API 模式启用 image_generate 和 image_edit。图生图参考图与返回结果都只使用 URL。
+            </p>
             {error && <div className="error-line">{error}</div>}
             <div className="provider-form-actions">
               <button className="primary-btn" type="submit">
@@ -3795,8 +3703,6 @@ function ProviderPanel({
   const defaultProvider = providers.find((provider) => provider.is_default);
   const titleProvider = providers.find((provider) => String(provider.id) === settingsForm.title_provider_id);
   const chatProviders = providers.filter((provider) => provider.is_visible);
-  const visibleProviderCount = providers.filter((provider) => provider.is_visible).length;
-  const activeProviderCount = providers.filter((provider) => provider.is_visible && provider.is_active).length;
   const providerModalLabel = editingFeature === 'title' ? '对话标题 LLM' : '主聊天 LLM';
 
   useEffect(() => {
@@ -3985,28 +3891,6 @@ function ProviderPanel({
           <div>
             <span>标题生成模型</span>
             <strong>{titleProvider ? `${titleProvider.name} · ${titleProvider.model}` : '未配置'}</strong>
-          </div>
-        </div>
-      </section>
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>模型状态</h2>
-            <p>这里只显示前台聊天模型数量，内部功能模型已经拆到各自功能页单独配置。</p>
-          </div>
-        </div>
-        <div className="admin-summary-list admin-summary-list--compact">
-          <div>
-            <span>前台可见</span>
-            <strong>{visibleProviderCount} 个</strong>
-          </div>
-          <div>
-            <span>启用聊天模型</span>
-            <strong>{activeProviderCount} 个</strong>
-          </div>
-          <div>
-            <span>标题 LLM</span>
-            <strong>{titleProvider ? '已单独配置' : '未配置'}</strong>
           </div>
         </div>
       </section>
