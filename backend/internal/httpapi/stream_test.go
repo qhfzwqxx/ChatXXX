@@ -1705,6 +1705,11 @@ func TestStreamResponsesToolLoop(t *testing.T) {
 				"response": map[string]interface{}{
 					"output": []map[string]interface{}{
 						{
+							"id":      "rs_1",
+							"type":    "reasoning",
+							"summary": []map[string]interface{}{},
+						},
+						{
 							"id":        "fc_1",
 							"call_id":   "call_1",
 							"type":      "function_call",
@@ -1788,6 +1793,12 @@ func TestStreamResponsesToolLoop(t *testing.T) {
 	}
 	if !foundOutput {
 		t.Fatalf("second request missing function_call_output: %s", calls[1])
+	}
+	if strings.Contains(calls[1], `"id":"rs_1"`) {
+		t.Fatalf("second request should not include non-persisted reasoning item id: %s", calls[1])
+	}
+	if strings.Contains(calls[1], `"id":"fc_1"`) {
+		t.Fatalf("second request should not include non-persisted function_call item id: %s", calls[1])
 	}
 	if !strings.Contains(recorder.Body.String(), "event: tool_steps") {
 		t.Fatalf("expected tool_steps event in stream: %s", recorder.Body.String())
@@ -2255,9 +2266,10 @@ func TestStreamResponsesPreservesReasoningSummaryForToolContinuation(t *testing.
 				"response": map[string]interface{}{
 					"output": []map[string]interface{}{
 						{
-							"id":      "rs_1",
-							"type":    "reasoning",
-							"summary": []interface{}{},
+							"id":                "rs_1",
+							"type":              "reasoning",
+							"summary":           []interface{}{},
+							"encrypted_content": "encrypted-reasoning",
 						},
 						{
 							"type":      "function_call",
@@ -2320,6 +2332,12 @@ func TestStreamResponsesPreservesReasoningSummaryForToolContinuation(t *testing.
 	}
 	if _, ok := reasoning["summary"]; !ok {
 		t.Fatalf("expected reasoning summary to be preserved, got %#v", reasoning)
+	}
+	if reasoning["encrypted_content"] != "encrypted-reasoning" {
+		t.Fatalf("expected encrypted reasoning content to be preserved, got %#v", reasoning)
+	}
+	if _, ok := reasoning["id"]; ok {
+		t.Fatalf("reasoning id should not be sent back in stateless input, got %#v", reasoning)
 	}
 }
 

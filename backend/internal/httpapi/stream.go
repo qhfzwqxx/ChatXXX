@@ -999,25 +999,65 @@ func responseOutputItemsForToolCall(items []responseOutputItem, call responseToo
 	includedCall := false
 	for _, item := range items {
 		if item.Type != "function_call" {
-			selected = append(selected, item)
+			if contextItem, ok := responseContextItemForToolLoop(item); ok {
+				selected = append(selected, contextItem)
+			}
 			continue
 		}
 		if !includedCall && responseOutputItemMatchesCall(item, call) {
-			selected = append(selected, item)
+			selected = append(selected, responseFunctionCallInputItem(item, call))
 			includedCall = true
 		}
 	}
 	if !includedCall {
-		selected = append(selected, responseOutputItem{
-			Type:      "function_call",
-			ID:        call.ID,
-			CallID:    call.CallID,
-			Name:      call.Name,
-			Arguments: call.Arguments,
-			Status:    "completed",
-		})
+		selected = append(selected, responseFunctionCallInputItem(responseOutputItem{}, call))
 	}
 	return selected
+}
+
+func responseContextItemForToolLoop(item responseOutputItem) (responseOutputItem, bool) {
+	if item.Type == "reasoning" && strings.TrimSpace(item.EncryptedContent) != "" {
+		return responseOutputItem{
+			Type:             "reasoning",
+			Summary:          item.Summary,
+			EncryptedContent: item.EncryptedContent,
+		}, true
+	}
+	if item.Type == "message" && item.Role == "assistant" && len(item.Content) > 0 {
+		return responseOutputItem{
+			Type:    "message",
+			Role:    "assistant",
+			Status:  "completed",
+			Content: item.Content,
+		}, true
+	}
+	return responseOutputItem{}, false
+}
+
+func responseFunctionCallInputItem(item responseOutputItem, call responseToolCall) responseOutputItem {
+	callID := strings.TrimSpace(item.CallID)
+	if callID == "" {
+		callID = call.CallID
+	}
+	name := strings.TrimSpace(item.Name)
+	if name == "" {
+		name = call.Name
+	}
+	arguments := item.Arguments
+	if arguments == "" {
+		arguments = call.Arguments
+	}
+	status := strings.TrimSpace(item.Status)
+	if status == "" {
+		status = "completed"
+	}
+	return responseOutputItem{
+		Type:      "function_call",
+		CallID:    callID,
+		Name:      name,
+		Arguments: arguments,
+		Status:    status,
+	}
 }
 
 func responseOutputItemMatchesCall(item responseOutputItem, call responseToolCall) bool {
