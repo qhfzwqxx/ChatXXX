@@ -4,6 +4,18 @@ export type User = {
   name: string;
   role: 'admin' | 'user';
   status: string;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type AdminUser = User & {
+  created_at: string;
+  updated_at: string;
+  conversation_count: number;
+  message_count: number;
+  memory_count: number;
+  session_count: number;
+  last_session_at: string;
 };
 
 export type Provider = {

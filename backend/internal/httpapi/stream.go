@@ -43,10 +43,6 @@ const responsesBaseToolInstruction = "You have local tools available in this cha
 
 const responsesWorkspaceToolInstruction = "\n\nWorkspace files: user uploads are stored in a per-user workspace. User messages may list workspace file names, paths, MIME type, size, and dimensions. Image tool routing rules:\n1. In Responses image mode, the only image tool is response_image. Use it for text-to-image and image-to-image/reference generation.\n2. In Chat Completions image mode, the only image tool is chat_image. Use it for text-to-image and image-to-image/reference generation.\n3. In Image API mode, image_generate creates images and reference-based image-to-image generations; image_edit is only for explicit mask/mask image/mask_index/mask_path edits.\n4. For 图生图, 以这张图为参考生成, 以这张图为基础生成, 参考这张图重新画, 按这张图的构图/主体/姿势生成, 换风格生成, 风格化, generate from this image, use this image as reference, or style transfer, pass a URL or workspace path in the image argument of the available generation tool.\n5. Never ask the user to paste base64 image data and never put base64 in image tool arguments.\n\nGenerated-image display rule: image tool results are already displayed to the user in dedicated image tool cards by the chat UI. After an image tool returns images, do not repeat the generated images in the assistant text with Markdown image syntax, HTML img tags, raw base64, or duplicate image URLs. You may still write ordinary text around the result if it is useful."
 
-const responsesUniFuncsToolInstruction = responsesBaseToolInstruction + responsesWorkspaceToolInstruction + "\n\nCurrent web tool mode: UniFuncs. Available web tools are web_search and web_reader. The searching tool is not available in this mode.\n\nFor web_search, infer the user's real intent before calling the tool. If the wording is misspelled, transliterated, abbreviated, or mixed-language, resolve it to the most likely real-world person, place, event, product, or topic in your own reasoning, then search that intended target. Do not mechanically copy the user's raw text into the query. Ask for clarification only when multiple interpretations are equally plausible or the target cannot be inferred with reasonable confidence.\n\nFor web_reader, call it when there is a concrete URL to read, including URLs returned by web_search. Prefer format=markdown unless plain text is specifically better.\n\nFor web/current/research questions, prefer the combined workflow whenever useful: first call web_search to discover candidate pages, then call web_reader on the most relevant 1 to 3 result URLs before giving the final answer. Use this search-then-read workflow especially for news, recent facts, product/company/person details, documentation lookups, and any answer that benefits from page-level evidence."
-
-const responsesSearchingToolInstruction = responsesBaseToolInstruction + responsesWorkspaceToolInstruction + "\n\nCurrent web tool mode: Searching. The only available web search tool is searching. web_search and web_reader are not available in this mode.\n\nFor web/current/research questions, call searching with a concise query and use the returned content as the browsing/search evidence before giving the final answer."
-
 var errGenerationStopped = errors.New("generation stopped")
 
 type streamRequest struct {
@@ -148,6 +144,20 @@ type runtimeProvider struct {
 	RequestMode    string
 	ResponseFormat string
 	Active         bool
+}
+
+type responseToolAvailability struct {
+	Time   bool
+	Search bool
+	Image  bool
+}
+
+func allResponseToolsAvailable() responseToolAvailability {
+	return responseToolAvailability{Time: true, Search: true, Image: true}
+}
+
+func (a responseToolAvailability) any() bool {
+	return a.Time || a.Search || a.Image
 }
 
 func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
@@ -746,14 +756,19 @@ func (s *Server) streamResponses(ctx context.Context, w http.ResponseWriter, pro
 	input := buildResponsesInput(messages, latest)
 	searchMode := s.searchToolMode()
 	imageMode := s.imageToolMode()
-	tools := responseToolDefinitionsForImageMode(searchMode, imageMode)
+	toolAvailability := responseToolAvailability{
+		Time:   s.timeToolEnabled(),
+		Search: s.searchToolEnabled(),
+		Image:  s.imageToolEnabled(),
+	}
+	tools := responseToolDefinitionsForAvailability(searchMode, imageMode, toolAvailability)
 	toolCtx := responseToolContext{Context: ctx, ConversationID: conversationID, UserID: userID, PublicBaseURL: publicBaseURL}
 	var full strings.Builder
 	needTextBeforeTool := false
 	retriedStreamDisconnect := false
 	for round := 0; round < maxResponsesToolRounds; round++ {
 		persistRound := prefixedPersist(full.String(), persist)
-		result, err := s.readResponsesRound(ctx, w, provider, conversation, memoryInstruction, workspaceInstruction, input, tools, searchMode, persistRound, shouldStop)
+		result, err := s.readResponsesRound(ctx, w, provider, conversation, memoryInstruction, workspaceInstruction, input, tools, searchMode, toolAvailability, persistRound, shouldStop)
 		textAlreadyAppended := false
 		if err != nil {
 			hasToolCall := len(result.ToolCalls) > 0
@@ -1065,8 +1080,13 @@ func responseToolDefinitions(mode string) []map[string]interface{} {
 }
 
 func responseToolDefinitionsForImageMode(mode, imageMode string) []map[string]interface{} {
-	tools := []map[string]interface{}{
-		{
+	return responseToolDefinitionsForAvailability(mode, imageMode, allResponseToolsAvailable())
+}
+
+func responseToolDefinitionsForAvailability(mode, imageMode string, availability responseToolAvailability) []map[string]interface{} {
+	tools := make([]map[string]interface{}, 0)
+	if availability.Time {
+		tools = append(tools, map[string]interface{}{
 			"type":        "function",
 			"name":        "get_current_time",
 			"description": "Get the current time for an optional IANA timezone.",
@@ -1081,9 +1101,14 @@ func responseToolDefinitionsForImageMode(mode, imageMode string) []map[string]in
 				"required":             []string{},
 				"additionalProperties": false,
 			},
-		},
+		})
 	}
-	tools = append(tools, imageToolDefinitions(imageMode)...)
+	if availability.Image {
+		tools = append(tools, imageToolDefinitions(imageMode)...)
+	}
+	if !availability.Search {
+		return tools
+	}
 	if normalizeSearchToolMode(mode) == searchToolModeSearching {
 		return append(tools, map[string]interface{}{
 			"type":        "function",
@@ -1175,22 +1200,38 @@ func responseToolDefinitionsForImageMode(mode, imageMode string) []map[string]in
 	)
 }
 
-func responseToolInstructions(mode string) string {
-	if normalizeSearchToolMode(mode) == searchToolModeSearching {
-		return responsesSearchingToolInstruction
+func responseToolInstructions(mode string, availability responseToolAvailability) string {
+	if !availability.any() {
+		return ""
 	}
-	return responsesUniFuncsToolInstruction
+	parts := []string{responsesBaseToolInstruction}
+	if availability.Image {
+		parts = append(parts, strings.TrimSpace(responsesWorkspaceToolInstruction))
+	}
+	if availability.Search {
+		if normalizeSearchToolMode(mode) == searchToolModeSearching {
+			parts = append(parts, "Current web tool mode: Searching. The only available web search tool is searching. web_search and web_reader are not available in this mode.\n\nFor web/current/research questions, call searching with a concise query and use the returned content as the browsing/search evidence before giving the final answer.")
+		} else {
+			parts = append(parts, "Current web tool mode: UniFuncs. Available web tools are web_search and web_reader. The searching tool is not available in this mode.\n\nFor web_search, infer the user's real intent before calling the tool. If the wording is misspelled, transliterated, abbreviated, or mixed-language, resolve it to the most likely real-world person, place, event, product, or topic in your own reasoning, then search that intended target. Do not mechanically copy the user's raw text into the query. Ask for clarification only when multiple interpretations are equally plausible or the target cannot be inferred with reasonable confidence.\n\nFor web_reader, call it when there is a concrete URL to read, including URLs returned by web_search. Prefer format=markdown unless plain text is specifically better.\n\nFor web/current/research questions, prefer the combined workflow whenever useful: first call web_search to discover candidate pages, then call web_reader on the most relevant 1 to 3 result URLs before giving the final answer. Use this search-then-read workflow especially for news, recent facts, product/company/person details, documentation lookups, and any answer that benefits from page-level evidence.")
+		}
+	}
+	if availability.Time {
+		parts = append(parts, "Time tool: get_current_time is available for reading the current time. Use an IANA timezone such as Asia/Shanghai when the user asks for a specific location or timezone.")
+	}
+	return strings.Join(parts, "\n\n")
 }
 
-func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, memoryInstruction, workspaceInstruction string, input []interface{}, tools []map[string]interface{}, mode string, persist streamPersistFunc, shouldStop func() bool) (responsesRoundResult, error) {
+func (s *Server) readResponsesRound(ctx context.Context, w http.ResponseWriter, provider runtimeProvider, conversation *Conversation, memoryInstruction, workspaceInstruction string, input []interface{}, tools []map[string]interface{}, mode string, availability responseToolAvailability, persist streamPersistFunc, shouldStop func() bool) (responsesRoundResult, error) {
 	requestBody := map[string]interface{}{
-		"model":       provider.Model,
-		"input":       input,
-		"stream":      true,
-		"tool_choice": "auto",
-		"tools":       tools,
+		"model":  provider.Model,
+		"input":  input,
+		"stream": true,
 	}
-	instructions := responseToolInstructions(mode)
+	if len(tools) > 0 {
+		requestBody["tool_choice"] = "auto"
+		requestBody["tools"] = tools
+	}
+	instructions := responseToolInstructions(mode, availability)
 	if conversation != nil && strings.TrimSpace(conversation.SystemPrompt) != "" {
 		instructions = instructions + "\n\n" + strings.TrimSpace(conversation.SystemPrompt)
 	}
@@ -1692,38 +1733,62 @@ func (s *Server) executeResponseToolWithContext(call responseToolCall, mode stri
 	toolMode := normalizeSearchToolMode(mode)
 	switch strings.TrimSpace(call.Name) {
 	case "get_current_time":
+		if !s.timeToolEnabled() {
+			return disabledToolJSON("get_current_time", "get_current_time is disabled by admin settings")
+		}
 		return executeGetCurrentTimeTool(call.Arguments)
 	case imageToolNameResponseImage:
+		if !s.imageToolEnabled() {
+			return disabledToolJSON(imageToolNameResponseImage, "response_image is disabled by admin settings")
+		}
 		if s.imageToolMode() != imageToolModeResponses {
 			return disabledToolJSON(imageToolNameResponseImage, "response_image is disabled because Responses image mode is not active")
 		}
 		return s.executeResponseImageTool(call.Arguments, toolCtx)
 	case imageToolNameChatImage:
+		if !s.imageToolEnabled() {
+			return disabledToolJSON(imageToolNameChatImage, "chat_image is disabled by admin settings")
+		}
 		if s.imageToolMode() != imageToolModeChatCompletions {
 			return disabledToolJSON(imageToolNameChatImage, "chat_image is disabled because Chat Completions image mode is not active")
 		}
 		return s.executeChatImageTool(call.Arguments, toolCtx)
 	case "image_generate":
+		if !s.imageToolEnabled() {
+			return disabledToolJSON(imageToolNameGenerate, "image_generate is disabled by admin settings")
+		}
 		if s.imageToolMode() != imageToolModeImageAPI {
 			return disabledToolJSON(imageToolNameGenerate, "image_generate is disabled because Image API mode is not active")
 		}
 		return s.executeImageGenerateToolWithContext(call.Arguments, toolCtx)
 	case "image_edit":
+		if !s.imageToolEnabled() {
+			return disabledToolJSON(imageToolNameEdit, "image_edit is disabled by admin settings")
+		}
 		if s.imageToolMode() != imageToolModeImageAPI {
 			return disabledToolJSON(imageToolNameEdit, "image_edit is disabled because Image API mode is not active")
 		}
 		return s.executeImageEditTool(call, toolCtx)
 	case "web_search":
+		if !s.searchToolEnabled() {
+			return disabledToolJSON("web_search", "web_search is disabled by admin settings")
+		}
 		if toolMode != searchToolModeUniFuncs {
 			return disabledToolJSON("web_search", "web_search is disabled because Searching mode is active")
 		}
 		return s.executeWebSearchTool(call.Arguments)
 	case "web_reader":
+		if !s.searchToolEnabled() {
+			return disabledToolJSON("web_reader", "web_reader is disabled by admin settings")
+		}
 		if toolMode != searchToolModeUniFuncs {
 			return disabledToolJSON("web_reader", "web_reader is disabled because Searching mode is active")
 		}
 		return s.executeWebReaderTool(call.Arguments)
 	case "searching":
+		if !s.searchToolEnabled() {
+			return disabledToolJSON("searching", "searching is disabled by admin settings")
+		}
 		if toolMode != searchToolModeSearching {
 			return disabledToolJSON("searching", "searching is disabled because UniFuncs mode is active")
 		}

@@ -1,4 +1,4 @@
-import type { AttachmentPayload, Conversation, Memory, Message, Provider, User } from './types';
+import type { AdminUser, AttachmentPayload, Conversation, Memory, Message, Provider, User } from './types';
 
 type Envelope<T> = {
   success: boolean;
@@ -31,6 +31,10 @@ export const api = {
     request<{ user: User }>('/api/auth/login', { method: 'POST', body: JSON.stringify(payload) }),
   logout: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
   me: () => request<{ user: User }>('/api/auth/me'),
+  adminUsers: () =>
+    request<{ users: AdminUser[]; summary: { total: number; active: number; disabled: number; admins: number } }>('/api/admin/users'),
+  updateAdminUser: (id: number, payload: { role: 'admin' | 'user'; status: string }) =>
+    request<{ user: User }>(`/api/admin/users/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   providers: () => request<{ providers: Provider[] }>('/api/admin/providers'),
   createProvider: (payload: Partial<Provider>) =>
     request<{ provider: Provider }>('/api/admin/providers', { method: 'POST', body: JSON.stringify(payload) }),
@@ -40,6 +44,7 @@ export const api = {
   adminSettings: () => request<{ settings: Record<string, { key: string; value: string }> }>('/api/admin/settings'),
   updateAdminSettings: (payload: {
     search_tool_mode: string;
+    search_tool_enabled: string;
     unifuncs_api_key: string;
     unifuncs_base_url: string;
     web_search_card_result_count: string;
@@ -48,6 +53,7 @@ export const api = {
     searching_model: string;
     searching_api_id: string;
     image_tool_mode: string;
+    image_tool_enabled: string;
     image_tool_base_url: string;
     image_tool_api_key: string;
     image_generate_model: string;
@@ -65,6 +71,7 @@ export const api = {
     memory_max_actions_per_run: string;
     memory_inject_limit: string;
     embedding_top_k: string;
+    time_tool_enabled: string;
   }) =>
     request<{ ok: boolean }>('/api/admin/settings', { method: 'PATCH', body: JSON.stringify(payload) }),
   clientSettings: () => request<{ settings: { web_search_card_result_count: number } }>('/api/settings'),

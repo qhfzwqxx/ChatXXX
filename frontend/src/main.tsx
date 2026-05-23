@@ -3,7 +3,6 @@ import { createRoot } from 'react-dom/client';
 import {
   Archive,
   ArrowUp,
-  Activity,
   BookMarked,
   Check,
   ChevronDown,
@@ -21,6 +20,7 @@ import {
   SquarePen,
   Sparkles,
   Trash2,
+  Users,
   Wrench,
   X
 } from 'lucide-react';
@@ -30,7 +30,7 @@ import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
 import { api, streamChat } from './api';
-import type { AttachmentPayload, Conversation, Memory, MemoryHit, MemoryHitPayload, Message, Provider, User } from './types';
+import type { AdminUser, AttachmentPayload, Conversation, Memory, MemoryHit, MemoryHitPayload, Message, Provider, User } from './types';
 import './styles.css';
 
 type AuthMode = 'login' | 'register';
@@ -75,6 +75,7 @@ type ConfirmDialogState = {
 
 type AdminSettings = {
   search_tool_mode: string;
+  search_tool_enabled: string;
   unifuncs_api_key: string;
   unifuncs_base_url: string;
   web_search_card_result_count: string;
@@ -83,6 +84,7 @@ type AdminSettings = {
   searching_model: string;
   searching_api_id: string;
   image_tool_mode: string;
+  image_tool_enabled: string;
   image_tool_base_url: string;
   image_tool_api_key: string;
   image_generate_model: string;
@@ -100,12 +102,14 @@ type AdminSettings = {
   memory_max_actions_per_run: string;
   memory_inject_limit: string;
   embedding_top_k: string;
+  time_tool_enabled: string;
 };
 
-type AdminTab = 'models' | 'tools' | 'memory' | 'runtime';
+type AdminTab = 'models' | 'tools' | 'memory' | 'users';
 
 const emptyAdminSettings: AdminSettings = {
   search_tool_mode: 'searching',
+  search_tool_enabled: '1',
   unifuncs_api_key: '',
   unifuncs_base_url: '',
   web_search_card_result_count: '4',
@@ -114,6 +118,7 @@ const emptyAdminSettings: AdminSettings = {
   searching_model: '',
   searching_api_id: '',
   image_tool_mode: 'responses',
+  image_tool_enabled: '1',
   image_tool_base_url: 'https://api.tu-zi.com',
   image_tool_api_key: '',
   image_generate_model: 'gpt-image-2',
@@ -130,7 +135,8 @@ const emptyAdminSettings: AdminSettings = {
   memory_recent_message_limit: '12',
   memory_max_actions_per_run: '5',
   memory_inject_limit: '20',
-  embedding_top_k: '8'
+  embedding_top_k: '8',
+  time_tool_enabled: '1'
 };
 
 const recoveredStreamDelay = 35;
@@ -2913,6 +2919,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
     const settings = res.settings || {};
     setAdminSettings({
       search_tool_mode: settings.search_tool_mode?.value || 'searching',
+      search_tool_enabled: settings.search_tool_enabled?.value || '1',
       unifuncs_api_key: settings.unifuncs_api_key?.value || '',
       unifuncs_base_url: settings.unifuncs_base_url?.value || '',
       web_search_card_result_count: settings.web_search_card_result_count?.value || '4',
@@ -2921,6 +2928,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
       searching_model: settings.searching_model?.value || '',
       searching_api_id: settings.searching_api_id?.value || '',
       image_tool_mode: settings.image_tool_mode?.value || 'responses',
+      image_tool_enabled: settings.image_tool_enabled?.value || '1',
       image_tool_base_url: settings.image_tool_base_url?.value || 'https://api.tu-zi.com',
       image_tool_api_key: settings.image_tool_api_key?.value || '',
       image_generate_model: settings.image_generate_model?.value || 'gpt-image-2',
@@ -2937,7 +2945,8 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
       memory_recent_message_limit: settings.memory_recent_message_limit?.value || '12',
       memory_max_actions_per_run: settings.memory_max_actions_per_run?.value || '5',
       memory_inject_limit: settings.memory_inject_limit?.value || '20',
-      embedding_top_k: settings.embedding_top_k?.value || '8'
+      embedding_top_k: settings.embedding_top_k?.value || '8',
+      time_tool_enabled: settings.time_tool_enabled?.value || '1'
     });
   }
 
@@ -2946,7 +2955,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
     void refreshSettings();
   }, []);
 
-  const activeTabTitle = activeTab === 'models' ? '对话' : activeTab === 'tools' ? '工具' : activeTab === 'memory' ? '记忆' : '运行';
+  const activeTabTitle = activeTab === 'models' ? '对话' : activeTab === 'tools' ? '工具' : activeTab === 'memory' ? '记忆' : '用户';
 
   function selectTab(tab: AdminTab) {
     setActiveTab(tab);
@@ -2982,9 +2991,9 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
             <BookMarked size={16} />
             记忆
           </button>
-          <button className={'admin-nav-item ' + (activeTab === 'runtime' ? 'active' : '')} type="button" onClick={() => selectTab('runtime')}>
-            <Activity size={16} />
-            运行
+          <button className={'admin-nav-item ' + (activeTab === 'users' ? 'active' : '')} type="button" onClick={() => selectTab('users')}>
+            <Users size={16} />
+            用户
           </button>
         </nav>
       </aside>
@@ -3010,44 +3019,231 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
         ) : activeTab === 'memory' ? (
           <MemorySettingsPanel providers={providers} settings={adminSettings} onChanged={refreshSettings} onProvidersChanged={refreshProviders} />
         ) : (
-          <UsagePanel />
+          <UserManagementPanel currentUser={user} />
         )}
       </section>
     </main>
   );
 }
 
-function UsagePanel() {
+function UserManagementPanel({ currentUser }: { currentUser: User }) {
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [summary, setSummary] = useState({ total: 0, active: 0, disabled: 0, admins: 0 });
+  const [query, setQuery] = useState('');
+  const [filter, setFilter] = useState<'all' | 'active' | 'disabled' | 'admin'>('all');
+  const [loading, setLoading] = useState(true);
+  const [savingId, setSavingId] = useState<number | null>(null);
+  const [error, setError] = useState('');
+
+  async function loadUsers() {
+    setLoading(true);
+    setError('');
+    try {
+      const res = await api.adminUsers();
+      setUsers(res.users || []);
+      setSummary(res.summary || { total: 0, active: 0, disabled: 0, admins: 0 });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '读取用户失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadUsers();
+  }, []);
+
+  const filteredUsers = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return users.filter((item) => {
+      const matchesFilter =
+        filter === 'all' || (filter === 'admin' ? item.role === 'admin' : item.status === filter);
+      if (!matchesFilter) return false;
+      if (!needle) return true;
+      return `${item.name} ${item.email} ${item.role} ${item.status}`.toLowerCase().includes(needle);
+    });
+  }, [filter, query, users]);
+
+  async function updateUser(target: AdminUser, patch: Partial<Pick<AdminUser, 'role' | 'status'>>) {
+    setSavingId(target.id);
+    setError('');
+    try {
+      await api.updateAdminUser(target.id, {
+        role: patch.role || target.role,
+        status: patch.status || target.status
+      });
+      await loadUsers();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '更新用户失败');
+    } finally {
+      setSavingId(null);
+    }
+  }
+
+  const totalConversations = users.reduce((sum, item) => sum + item.conversation_count, 0);
+  const totalMemories = users.reduce((sum, item) => sum + item.memory_count, 0);
+
   return (
     <div className="admin-panel">
-      <section className="admin-section-card">
+      {error && <div className="admin-error-banner">{error}</div>}
+      <section className="admin-section-card admin-user-overview-card">
         <div className="provider-form-head">
           <div>
-            <h2>运行情况</h2>
-            <p>这里以后可以放调用量、成本、错误率、请求日志等统计。</p>
+            <h2>用户管理</h2>
+            <p>查看后台用户、登录状态和使用规模，必要时调整角色或停用账号。</p>
+          </div>
+          <button className="text-btn" type="button" onClick={() => void loadUsers()} disabled={loading}>
+            <RotateCcw size={16} />
+            {loading ? '刷新中' : '刷新'}
+          </button>
+        </div>
+        <div className="admin-user-stat-grid">
+          <div>
+            <span>用户总数</span>
+            <strong>{summary.total}</strong>
+          </div>
+          <div>
+            <span>启用用户</span>
+            <strong>{summary.active}</strong>
+          </div>
+          <div>
+            <span>管理员</span>
+            <strong>{summary.admins}</strong>
+          </div>
+          <div>
+            <span>禁用用户</span>
+            <strong>{summary.disabled}</strong>
           </div>
         </div>
-        <div className="admin-placeholder-grid">
-          <div>
-            <strong>调用量</strong>
-            <span>待接入</span>
+      </section>
+      <section className="admin-section-card admin-user-management-card">
+        <div className="admin-user-toolbar">
+          <div className="admin-user-search">
+            <Search size={16} />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索姓名、邮箱、角色或状态" />
           </div>
-          <div>
-            <strong>成本</strong>
-            <span>待接入</span>
+          <div className="admin-user-filters" role="group" aria-label="用户筛选">
+            <button className={filter === 'all' ? 'active' : ''} type="button" onClick={() => setFilter('all')}>
+              全部
+            </button>
+            <button className={filter === 'active' ? 'active' : ''} type="button" onClick={() => setFilter('active')}>
+              启用
+            </button>
+            <button className={filter === 'admin' ? 'active' : ''} type="button" onClick={() => setFilter('admin')}>
+              管理员
+            </button>
+            <button className={filter === 'disabled' ? 'active' : ''} type="button" onClick={() => setFilter('disabled')}>
+              禁用
+            </button>
           </div>
-          <div>
-            <strong>错误率</strong>
-            <span>待接入</span>
-          </div>
-          <div>
-            <strong>请求日志</strong>
-            <span>待接入</span>
-          </div>
+        </div>
+        <div className="admin-user-meta-row">
+          <span>{filteredUsers.length} 个匹配用户</span>
+          <span>{totalConversations} 个对话</span>
+          <span>{totalMemories} 条记忆</span>
+        </div>
+        <div className="admin-user-list">
+          {loading ? (
+            <div className="empty-hint">正在读取用户...</div>
+          ) : filteredUsers.length ? (
+            filteredUsers.map((item) => {
+              const isSelf = item.id === currentUser.id;
+              const saving = savingId === item.id;
+              return (
+                <article className={'admin-user-card ' + (item.status === 'active' ? 'is-active' : 'is-disabled')} key={item.id}>
+                  <div className="admin-user-card__head">
+                    <div>
+                      <strong>{item.name || item.email}</strong>
+                      <span>{item.email}</span>
+                    </div>
+                    <div className="provider-badges">
+                      {isSelf && <span>当前账号</span>}
+                      <span>{userRoleLabel(item.role)}</span>
+                      <span>{userStatusLabel(item.status)}</span>
+                    </div>
+                  </div>
+                  <div className="admin-user-card__stats">
+                    <div>
+                      <span>对话</span>
+                      <strong>{item.conversation_count}</strong>
+                    </div>
+                    <div>
+                      <span>消息</span>
+                      <strong>{item.message_count}</strong>
+                    </div>
+                    <div>
+                      <span>记忆</span>
+                      <strong>{item.memory_count}</strong>
+                    </div>
+                    <div>
+                      <span>会话</span>
+                      <strong>{item.session_count}</strong>
+                    </div>
+                  </div>
+                  <div className="admin-user-card__foot">
+                    <small>注册 {formatAdminTime(item.created_at)}</small>
+                    <small>最近登录 {formatAdminTime(item.last_session_at)}</small>
+                  </div>
+                  <div className="admin-user-card__actions">
+                    <button
+                      className="icon-text-btn"
+                      type="button"
+                      disabled={saving || isSelf}
+                      onClick={() => void updateUser(item, { role: item.role === 'admin' ? 'user' : 'admin' })}
+                    >
+                      <CircleCheck size={15} />
+                      {item.role === 'admin' ? '设为用户' : '设为管理员'}
+                    </button>
+                    <button
+                      className={'icon-text-btn ' + (item.status === 'active' ? 'danger' : '')}
+                      type="button"
+                      disabled={saving || isSelf}
+                      onClick={() => void updateUser(item, { status: item.status === 'active' ? 'disabled' : 'active' })}
+                    >
+                      {item.status === 'active' ? <X size={15} /> : <Check size={15} />}
+                      {item.status === 'active' ? '禁用' : '启用'}
+                    </button>
+                  </div>
+                </article>
+              );
+            })
+          ) : (
+            <div className="empty-hint">没有匹配的用户</div>
+          )}
         </div>
       </section>
     </div>
   );
+}
+
+function userRoleLabel(role: string) {
+  return role === 'admin' ? '管理员' : '用户';
+}
+
+function userStatusLabel(status: string) {
+  return status === 'active' ? '启用' : '禁用';
+}
+
+function formatAdminTime(value: string) {
+  if (!value) return '暂无';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+}
+
+function isToolEnabled(value: string) {
+  return value !== '0';
+}
+
+function toolEnabledLabel(value: string) {
+  return isToolEnabled(value) ? '已启用' : '已停用';
 }
 
 function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onChanged: () => Promise<void> | void }) {
@@ -3088,76 +3284,67 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
 
   const mode = form.search_tool_mode === 'searching' ? 'searching' : 'unifuncs';
   const imageMode = form.image_tool_mode === 'responses' || form.image_tool_mode === 'chat_completions' ? form.image_tool_mode : 'image_api';
-  const searchModeLabel = mode === 'unifuncs' ? 'UniFuncs 联动' : 'Searching LLM';
-  const searchEndpoint = mode === 'unifuncs' ? form.unifuncs_base_url : form.searching_base_url;
-  const searchModel = mode === 'unifuncs' ? 'web_search / web_reader' : form.searching_model || '未填写';
-  const imageModeLabel = imageMode === 'responses' ? 'Responses' : imageMode === 'chat_completions' ? 'Chat Completions' : 'Image API';
-  const imageModelLabel =
-    imageMode === 'responses'
-      ? form.image_responses_model || '未填写'
-      : imageMode === 'chat_completions'
-        ? form.image_chat_model || '未填写'
-        : `${form.image_generate_model || '未填写'} / ${form.image_edit_model || '未填写'}`;
+  const searchToolEnabled = isToolEnabled(form.search_tool_enabled);
+  const imageToolEnabled = isToolEnabled(form.image_tool_enabled);
+  const timeToolEnabled = isToolEnabled(form.time_tool_enabled);
 
   return (
     <div className="admin-panel">
       {error && !searchModalOpen && !imageModalOpen && <div className="admin-error-banner">{error}</div>}
       <div className="admin-tool-grid">
-        <section className="admin-section-card admin-tool-card">
-          <div className="provider-form-head">
-            <div>
-              <h2>搜索工具配置</h2>
-              <p>当前对话工具只展示关键状态，完整密钥和参数通过弹窗维护。</p>
+        <section className="admin-section-card admin-tool-card admin-tool-card--simple">
+          <div className="admin-tool-card__head">
+            <h2>搜索工具</h2>
+            <div className="admin-card-actions admin-tool-card__actions">
+              <button
+                className={'tool-toggle-btn ' + (searchToolEnabled ? 'is-enabled' : 'is-disabled')}
+                type="button"
+                title={searchToolEnabled ? '点击停用搜索工具' : '点击启用搜索工具'}
+                onClick={() => void saveForm({ ...form, search_tool_enabled: searchToolEnabled ? '0' : '1' })}
+              >
+                {searchToolEnabled ? <CircleCheck size={15} /> : <X size={15} />}
+                {toolEnabledLabel(form.search_tool_enabled)}
+              </button>
+              <button className="primary-btn" type="button" onClick={() => { setError(''); setSearchModalOpen(true); }}>
+                <Settings size={16} />
+                设置
+              </button>
             </div>
-            <button className="primary-btn" type="button" onClick={() => { setError(''); setSearchModalOpen(true); }}>
-              <Settings size={16} />
-              设置
-            </button>
-          </div>
-          <div className="admin-tool-meta">
-            <div>
-              <span>当前模式</span>
-              <strong>{searchModeLabel}</strong>
-            </div>
-            <div>
-              <span>模型 / 能力</span>
-              <strong>{searchModel}</strong>
-            </div>
-            <div>
-              <span>接口地址</span>
-              <strong>{searchEndpoint || '未填写 Base URL'}</strong>
-            </div>
-            {mode === 'unifuncs' && (
-              <div>
-                <span>搜索卡片</span>
-                <strong>{form.web_search_card_result_count || '4'} 条</strong>
-              </div>
-            )}
           </div>
         </section>
-        <section className="admin-section-card admin-tool-card">
-          <div className="provider-form-head">
-            <div>
-              <h2>图片工具配置</h2>
-              <p>不同接口模式会启用不同图片工具，模型、尺寸和返回格式都在弹窗里维护。</p>
+        <section className="admin-section-card admin-tool-card admin-tool-card--simple">
+          <div className="admin-tool-card__head">
+            <h2>图片工具</h2>
+            <div className="admin-card-actions admin-tool-card__actions">
+              <button
+                className={'tool-toggle-btn ' + (imageToolEnabled ? 'is-enabled' : 'is-disabled')}
+                type="button"
+                title={imageToolEnabled ? '点击停用图片工具' : '点击启用图片工具'}
+                onClick={() => void saveForm({ ...form, image_tool_enabled: imageToolEnabled ? '0' : '1' })}
+              >
+                {imageToolEnabled ? <CircleCheck size={15} /> : <X size={15} />}
+                {toolEnabledLabel(form.image_tool_enabled)}
+              </button>
+              <button className="primary-btn" type="button" onClick={() => { setError(''); setImageModalOpen(true); }}>
+                <Settings size={16} />
+                设置
+              </button>
             </div>
-            <button className="primary-btn" type="button" onClick={() => { setError(''); setImageModalOpen(true); }}>
-              <Settings size={16} />
-              设置
-            </button>
           </div>
-          <div className="admin-tool-meta">
-            <div>
-              <span>调用模式</span>
-              <strong>{imageModeLabel}</strong>
-            </div>
-            <div>
-              <span>模型</span>
-              <strong>{imageModelLabel}</strong>
-            </div>
-            <div>
-              <span>接口地址</span>
-              <strong>{form.image_tool_base_url || '未填写 Base URL'}</strong>
+        </section>
+        <section className="admin-section-card admin-tool-card admin-tool-card--simple">
+          <div className="admin-tool-card__head">
+            <h2>读取时间</h2>
+            <div className="admin-card-actions admin-tool-card__actions">
+              <button
+                className={'tool-toggle-btn ' + (timeToolEnabled ? 'is-enabled' : 'is-disabled')}
+                type="button"
+                title={timeToolEnabled ? '点击停用读取时间工具' : '点击启用读取时间工具'}
+                onClick={() => void saveForm({ ...form, time_tool_enabled: timeToolEnabled ? '0' : '1' })}
+              >
+                {timeToolEnabled ? <CircleCheck size={15} /> : <X size={15} />}
+                {toolEnabledLabel(form.time_tool_enabled)}
+              </button>
             </div>
           </div>
         </section>
@@ -3485,34 +3672,11 @@ function MemorySettingsPanel({
 
   const memoryProvider = providers.find((provider) => String(provider.id) === form.memory_provider_id);
   const embeddingProvider = providers.find((provider) => String(provider.id) === form.embedding_provider_id);
-  const memoryReady = Boolean(memoryProvider && embeddingProvider);
   const llmModalTitle = editingFeature === 'embedding' ? '配置向量化 LLM' : '配置记忆 LLM';
 
   return (
     <div className="admin-panel">
       {error && !configModalOpen && !llmModalOpen && <div className="admin-error-banner">{error}</div>}
-      <section className="admin-section-card">
-        <div className="provider-form-head">
-          <div>
-            <h2>自动长期记忆</h2>
-            <p>回复完成后由记忆模型自动判断新增、更新或忽略，并用 Embedding 模型检索相关记忆注入上下文。</p>
-          </div>
-        </div>
-        <div className="admin-summary-list admin-summary-list--compact">
-          <div>
-            <span>状态</span>
-            <strong>{memoryReady ? '可用' : '未完整配置'}</strong>
-          </div>
-          <div>
-            <span>记忆 LLM</span>
-            <strong>{memoryProvider ? `${memoryProvider.name} · ${memoryProvider.model}` : '未配置'}</strong>
-          </div>
-          <div>
-            <span>向量化 LLM</span>
-            <strong>{embeddingProvider ? `${embeddingProvider.name} · ${embeddingProvider.model}` : '未配置'}</strong>
-          </div>
-        </div>
-      </section>
       <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
@@ -3574,15 +3738,15 @@ function MemorySettingsPanel({
             <strong>{form.memory_recent_message_limit || '12'} 条</strong>
           </div>
           <div>
-            <span>单轮动作</span>
+            <span>写入动作上限</span>
             <strong>{form.memory_max_actions_per_run || '5'} 个</strong>
           </div>
           <div>
-            <span>注入上限</span>
+            <span>注入条数上限</span>
             <strong>{form.memory_inject_limit || '20'} 条</strong>
           </div>
           <div>
-            <span>Top K</span>
+            <span>向量候选 Top K</span>
             <strong>{form.embedding_top_k || '8'}</strong>
           </div>
         </div>
@@ -3593,26 +3757,30 @@ function MemorySettingsPanel({
             <div className="provider-form-head">
               <div>
                 <h2>写入与检索限制</h2>
-                <p>控制记忆模型每次看多少上下文，以及单轮最多产生多少记忆动作。</p>
+                <p>先用 Embedding 取候选，再交给记忆 LLM 重排，最后把筛出的记忆注入主聊天上下文。</p>
               </div>
             </div>
             <label className="field-block">
-              记忆模型查看的最近消息数
+              自动写记忆时查看的最近消息数
               <input value={form.memory_recent_message_limit} onChange={(event) => setForm({ ...form, memory_recent_message_limit: event.target.value })} />
+              <span className="field-help">每次助手回复结束后，记忆 LLM 会参考最近这些消息，判断要不要新增、更新或忽略长期记忆。</span>
             </label>
             <label className="field-block">
-              单轮最多记忆动作
+              每轮最多写入/更新多少条记忆
               <input value={form.memory_max_actions_per_run} onChange={(event) => setForm({ ...form, memory_max_actions_per_run: event.target.value })} />
+              <span className="field-help">限制一次回复后最多产生多少个记忆动作，避免模型一次新增或改写太多长期记忆。</span>
             </label>
             <label className="field-block">
-              注入记忆上限
+              最终注入到聊天上下文的记忆上限
               <input value={form.memory_inject_limit} onChange={(event) => setForm({ ...form, memory_inject_limit: event.target.value })} />
+              <span className="field-help">用户下次提问时，rerank 之后最多把这么多条记忆放进主聊天 LLM 的上下文。</span>
             </label>
             <label className="field-block">
-              Embedding 检索 Top K
+              Embedding 先检索出的候选记忆 Top K
               <input value={form.embedding_top_k} onChange={(event) => setForm({ ...form, embedding_top_k: event.target.value })} />
+              <span className="field-help">先按向量相似度取前 K 条候选记忆，再交给记忆 LLM rerank；建议不小于“最终注入上限”。</span>
             </label>
-            <p className="field-help">用户提问时固定注入向量相似度最高的 10 条记忆；未配置记忆 LLM 时不会自动写入记忆，未配置 Embedding 时不会注入长期记忆。</p>
+            <p className="field-help">检索流程：Embedding Top K 取候选 → 记忆 LLM rerank → 按注入上限放入主聊天上下文。若 rerank 不可用，会按向量相似度排序注入。</p>
             {error && <div className="error-line">{error}</div>}
             <div className="provider-form-actions">
               <button className="primary-btn" type="submit">
@@ -3828,7 +3996,7 @@ function ProviderPanel({
             <strong>{defaultProvider?.is_active ? '启用' : '未启用'}</strong>
           </div>
         </div>
-        <div className="provider-list">
+        <div className="provider-list provider-list--chat-models">
           {chatProviders.map((provider) => (
             <div className="provider-card" key={provider.id}>
               <div className="provider-card__head">

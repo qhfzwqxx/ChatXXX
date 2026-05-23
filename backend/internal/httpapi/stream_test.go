@@ -489,6 +489,29 @@ func TestResponseToolDefinitionsRespectImageMode(t *testing.T) {
 	}
 }
 
+func TestResponseToolDefinitionsRespectAvailability(t *testing.T) {
+	disabledTools := responseToolDefinitionsForAvailability(searchToolModeSearching, imageToolModeResponses, responseToolAvailability{})
+	if len(disabledTools) != 0 {
+		t.Fatalf("disabled availability should not expose tools: %#v", disabledTools)
+	}
+
+	searchDisabledTools := responseToolDefinitionsForAvailability(searchToolModeSearching, imageToolModeResponses, responseToolAvailability{Time: true, Image: true})
+	if !hasToolForTest(searchDisabledTools, "get_current_time") || !hasToolForTest(searchDisabledTools, "response_image") {
+		t.Fatalf("search-disabled availability should still expose enabled time/image tools: %#v", searchDisabledTools)
+	}
+	if hasToolForTest(searchDisabledTools, "searching") || hasToolForTest(searchDisabledTools, "web_search") || hasToolForTest(searchDisabledTools, "web_reader") {
+		t.Fatalf("search-disabled availability should not expose search tools: %#v", searchDisabledTools)
+	}
+
+	imageDisabledTools := responseToolDefinitionsForAvailability(searchToolModeSearching, imageToolModeResponses, responseToolAvailability{Time: true, Search: true})
+	if !hasToolForTest(imageDisabledTools, "get_current_time") || !hasToolForTest(imageDisabledTools, "searching") {
+		t.Fatalf("image-disabled availability should still expose enabled time/search tools: %#v", imageDisabledTools)
+	}
+	if hasToolForTest(imageDisabledTools, "response_image") || hasToolForTest(imageDisabledTools, "chat_image") || hasToolForTest(imageDisabledTools, "image_generate") || hasToolForTest(imageDisabledTools, "image_edit") {
+		t.Fatalf("image-disabled availability should not expose image tools: %#v", imageDisabledTools)
+	}
+}
+
 func TestExecuteImageGenerateToolUsesDocumentedJSONFormat(t *testing.T) {
 	var gotAuth, gotContentType string
 	var gotBody map[string]interface{}

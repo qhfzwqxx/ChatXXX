@@ -33,6 +33,7 @@ const (
 )
 
 var adminSettingKeys = []string{
+	"search_tool_enabled",
 	"search_tool_mode",
 	"unifuncs_api_key",
 	"unifuncs_base_url",
@@ -41,6 +42,7 @@ var adminSettingKeys = []string{
 	"searching_api_key",
 	"searching_model",
 	"searching_api_id",
+	"image_tool_enabled",
 	"image_tool_mode",
 	"image_tool_base_url",
 	"image_tool_api_key",
@@ -52,6 +54,7 @@ var adminSettingKeys = []string{
 	"image_edit_size",
 	"image_default_quality",
 	"image_response_format",
+	"time_tool_enabled",
 	"title_provider_id",
 	"memory_provider_id",
 	"embedding_provider_id",
@@ -90,6 +93,9 @@ func (s *Server) handleAdminGetSettings(w http.ResponseWriter, r *http.Request) 
 		values["search_tool_mode"] = appSetting{Key: "search_tool_mode", Value: searchToolModeSearching}
 	}
 	defaults := map[string]string{
+		"search_tool_enabled":   "1",
+		"image_tool_enabled":    "1",
+		"time_tool_enabled":     "1",
 		"image_tool_mode":       defaultImageToolMode,
 		"image_tool_base_url":   defaultImageToolBaseURL,
 		"image_generate_model":  defaultImageGenerateModel,
@@ -119,6 +125,7 @@ func (s *Server) handleGetClientSettings(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Request) {
 	var req struct {
+		SearchToolEnabled        string `json:"search_tool_enabled"`
 		UniFuncsAPIKey           string `json:"unifuncs_api_key"`
 		UniFuncsBaseURL          string `json:"unifuncs_base_url"`
 		WebSearchCardResultCount string `json:"web_search_card_result_count"`
@@ -127,6 +134,7 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		SearchingAPIKey          string `json:"searching_api_key"`
 		SearchingModel           string `json:"searching_model"`
 		SearchingAPIID           string `json:"searching_api_id"`
+		ImageToolEnabled         string `json:"image_tool_enabled"`
 		ImageToolMode            string `json:"image_tool_mode"`
 		ImageToolBaseURL         string `json:"image_tool_base_url"`
 		ImageToolAPIKey          string `json:"image_tool_api_key"`
@@ -138,6 +146,7 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		ImageEditSize            string `json:"image_edit_size"`
 		ImageDefaultQuality      string `json:"image_default_quality"`
 		ImageResponseFormat      string `json:"image_response_format"`
+		TimeToolEnabled          string `json:"time_tool_enabled"`
 		TitleProviderID          string `json:"title_provider_id"`
 		MemoryProviderID         string `json:"memory_provider_id"`
 		EmbeddingProviderID      string `json:"embedding_provider_id"`
@@ -152,6 +161,7 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 	}
 	now := db.Now()
 	items := map[string]string{
+		"search_tool_enabled":          normalizeEnabledSetting(req.SearchToolEnabled),
 		"search_tool_mode":             normalizeSearchToolMode(req.SearchToolMode),
 		"unifuncs_api_key":             strings.TrimSpace(req.UniFuncsAPIKey),
 		"unifuncs_base_url":            strings.TrimSpace(req.UniFuncsBaseURL),
@@ -160,6 +170,7 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		"searching_api_key":            strings.TrimSpace(req.SearchingAPIKey),
 		"searching_model":              strings.TrimSpace(req.SearchingModel),
 		"searching_api_id":             strings.TrimSpace(req.SearchingAPIID),
+		"image_tool_enabled":           normalizeEnabledSetting(req.ImageToolEnabled),
 		"image_tool_mode":              normalizeImageToolMode(req.ImageToolMode),
 		"image_tool_base_url":          normalizeImageToolBaseURL(req.ImageToolBaseURL),
 		"image_tool_api_key":           strings.TrimSpace(req.ImageToolAPIKey),
@@ -171,6 +182,7 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 		"image_edit_size":              normalizeImageEditSize(req.ImageEditSize, defaultImageEditSize),
 		"image_default_quality":        normalizeImageQuality(req.ImageDefaultQuality, defaultImageToolQuality),
 		"image_response_format":        normalizeImageResponseFormat(req.ImageResponseFormat, defaultImageToolResponseFormat),
+		"time_tool_enabled":            normalizeEnabledSetting(req.TimeToolEnabled),
 		"title_provider_id":            strconv.Itoa(clampSettingInt(req.TitleProviderID, 0, 0, 1_000_000)),
 		"memory_provider_id":           strconv.Itoa(clampSettingInt(req.MemoryProviderID, 0, 0, 1_000_000)),
 		"embedding_provider_id":        strconv.Itoa(clampSettingInt(req.EmbeddingProviderID, 0, 0, 1_000_000)),
@@ -195,11 +207,40 @@ func (s *Server) handleAdminUpdateSettings(w http.ResponseWriter, r *http.Reques
 
 func isPersistentSetting(key string) bool {
 	switch key {
-	case "title_provider_id", "memory_provider_id", "embedding_provider_id", "memory_recent_message_limit", "memory_max_actions_per_run", "memory_inject_limit", "embedding_top_k", "web_search_card_result_count", "image_tool_mode", "image_tool_base_url", "image_generate_model", "image_edit_model", "image_responses_model", "image_chat_model", "image_default_size", "image_edit_size", "image_default_quality", "image_response_format":
+	case "search_tool_enabled", "image_tool_enabled", "time_tool_enabled", "title_provider_id", "memory_provider_id", "embedding_provider_id", "memory_recent_message_limit", "memory_max_actions_per_run", "memory_inject_limit", "embedding_top_k", "web_search_card_result_count", "image_tool_mode", "image_tool_base_url", "image_generate_model", "image_edit_model", "image_responses_model", "image_chat_model", "image_default_size", "image_edit_size", "image_default_quality", "image_response_format":
 		return true
 	default:
 		return false
 	}
+}
+
+func normalizeEnabledSetting(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "0", "false", "disabled", "off", "no":
+		return "0"
+	default:
+		return "1"
+	}
+}
+
+func (s *Server) settingEnabled(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(s.settingValue(key)))
+	if value == "" {
+		return fallback
+	}
+	return normalizeEnabledSetting(value) == "1"
+}
+
+func (s *Server) searchToolEnabled() bool {
+	return s.settingEnabled("search_tool_enabled", true)
+}
+
+func (s *Server) imageToolEnabled() bool {
+	return s.settingEnabled("image_tool_enabled", true)
+}
+
+func (s *Server) timeToolEnabled() bool {
+	return s.settingEnabled("time_tool_enabled", true)
 }
 
 func (s *Server) webSearchCardResultCount() int {

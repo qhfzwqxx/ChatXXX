@@ -93,6 +93,8 @@ func (s *Server) Routes() http.Handler {
 		r.Post("/api/admin/providers", s.handleAdminCreateProvider)
 		r.Patch("/api/admin/providers/{id}", s.handleAdminUpdateProvider)
 		r.Delete("/api/admin/providers/{id}", s.handleAdminDeleteProvider)
+		r.Get("/api/admin/users", s.handleAdminListUsers)
+		r.Patch("/api/admin/users/{id}", s.handleAdminUpdateUser)
 		r.Get("/api/admin/settings", s.handleAdminGetSettings)
 		r.Patch("/api/admin/settings", s.handleAdminUpdateSettings)
 		r.Get("/api/admin/usage", s.handleAdminUsage)
