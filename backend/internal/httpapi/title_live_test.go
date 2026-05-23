@@ -11,9 +11,9 @@ import (
 	"testing"
 )
 
-func TestLiveGenerateConversationTitleWithMemoryProvider(t *testing.T) {
+func TestLiveGenerateConversationTitleWithTitleProvider(t *testing.T) {
 	if os.Getenv("CHATXXX_LIVE_TITLE_TEST") != "1" {
-		t.Skip("set CHATXXX_LIVE_TITLE_TEST=1 to call the configured memory LLM")
+		t.Skip("set CHATXXX_LIVE_TITLE_TEST=1 to call the configured title LLM")
 	}
 	source, err := sql.Open("sqlite", liveTitleTestDBPath(t))
 	if err != nil {
@@ -27,13 +27,13 @@ func TestLiveGenerateConversationTitleWithMemoryProvider(t *testing.T) {
 		SELECT p.id, p.name, p.base_url, p.api_key, p.model, p.request_mode, p.response_format, p.is_active
 		FROM providers p
 		JOIN app_settings s ON CAST(s.value AS INTEGER)=p.id
-		WHERE s.key='memory_provider_id'
+		WHERE s.key='title_provider_id'
 	`).Scan(&provider.ID, &provider.Name, &provider.Base, &provider.Key, &provider.Model, &provider.RequestMode, &provider.ResponseFormat, &active)
 	if err != nil {
-		t.Fatalf("load memory provider: %v", err)
+		t.Fatalf("load title provider: %v", err)
 	}
 	if strings.TrimSpace(provider.Key) == "" || strings.TrimSpace(provider.Base) == "" || strings.TrimSpace(provider.Model) == "" || active != 1 {
-		t.Fatalf("memory provider is incomplete or inactive")
+		t.Fatalf("title provider is incomplete or inactive")
 	}
 
 	store, err := db.Open(filepath.Join(t.TempDir(), "chatxxx.sqlite"))
@@ -55,8 +55,8 @@ func TestLiveGenerateConversationTitleWithMemoryProvider(t *testing.T) {
 	`, provider.Name, provider.Base, provider.Key, provider.Model, provider.RequestMode, provider.ResponseFormat, now, now); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
-	if _, err := store.DB.Exec(`UPDATE app_settings SET value='3' WHERE key='memory_provider_id'`); err != nil {
-		t.Fatalf("seed memory setting: %v", err)
+	if _, err := store.DB.Exec(`UPDATE app_settings SET value='3' WHERE key='title_provider_id'`); err != nil {
+		t.Fatalf("seed title setting: %v", err)
 	}
 	if _, err := store.DB.Exec(`
 		INSERT INTO conversations (id, session_id, user_id, title, created_at, updated_at)

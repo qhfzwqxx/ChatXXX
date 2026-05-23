@@ -110,7 +110,7 @@ func TestAssistantMetadataIncludesMemoryHits(t *testing.T) {
 	}
 }
 
-func TestGenerateConversationTitleFallsBackToMemoryProvider(t *testing.T) {
+func TestGenerateConversationTitleUsesConfiguredTitleProvider(t *testing.T) {
 	var gotAuth string
 	var gotBody map[string]interface{}
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -145,11 +145,11 @@ func TestGenerateConversationTitleFallsBackToMemoryProvider(t *testing.T) {
 	}
 	if _, err := store.DB.Exec(`
 		INSERT INTO providers (id, name, base_url, api_key, model, request_mode, is_active, created_at, updated_at)
-		VALUES (11, 'memory', ?, 'title-key', 'title-model', 'chat_completions', 1, ?, ?)
+		VALUES (11, 'title', ?, 'title-key', 'title-model', 'chat_completions', 1, ?, ?)
 	`, upstream.URL+"/v1", now, now); err != nil {
 		t.Fatalf("seed provider: %v", err)
 	}
-	if _, err := store.DB.Exec(`UPDATE app_settings SET value='11' WHERE key='memory_provider_id'`); err != nil {
+	if _, err := store.DB.Exec(`UPDATE app_settings SET value='11' WHERE key='title_provider_id'`); err != nil {
 		t.Fatalf("seed setting: %v", err)
 	}
 	if _, err := store.DB.Exec(`

@@ -202,6 +202,29 @@ const emptyProviderForm: ProviderFormState = {
   is_active: true
 };
 
+function providerFormFromProvider(provider: Provider, overrides: Partial<ProviderFormState> = {}): ProviderFormState {
+  return {
+    name: provider.name,
+    base_url: provider.base_url,
+    api_key: '',
+    model: provider.model,
+    request_mode: provider.request_mode || 'chat_completions',
+    response_format: provider.response_format || '',
+    is_default: provider.is_default,
+    is_visible: provider.is_visible,
+    is_active: provider.is_active,
+    ...overrides
+  };
+}
+
+function providerPayloadFromForm(form: ProviderFormState) {
+  return {
+    ...form,
+    provider_type: 'openai_compatible',
+    capabilities: DEFAULT_PROVIDER_CAPABILITIES
+  };
+}
+
 function isWeChatBrowser() {
   return /micromessenger/i.test(window.navigator.userAgent);
 }
@@ -2872,6 +2895,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
   const [providers, setProviders] = useState<Provider[]>([]);
   const [adminSettings, setAdminSettings] = useState<AdminSettings>(emptyAdminSettings);
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
 
   async function refreshProviders() {
     const res = await api.providers();
@@ -2916,46 +2940,64 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
     void refreshSettings();
   }, []);
 
+  const activeTabTitle =
+    activeTab === 'overview' ? '概览' : activeTab === 'models' ? '模型' : activeTab === 'tools' ? '工具' : activeTab === 'memory' ? '记忆' : '运行';
+
+  function selectTab(tab: AdminTab) {
+    setActiveTab(tab);
+    setMobileSidebarOpen(false);
+  }
+
   return (
-    <main className="admin-shell">
+    <main className={'admin-shell ' + (mobileSidebarOpen ? 'mobile-sidebar-open' : '')}>
       <aside className="admin-sidebar">
         <div className="admin-sidebar-head">
-          <div>
+          <div className="admin-identity">
             <div className="brand-mark">
               <Sparkles size={20} />
               Admin
             </div>
             <div className="admin-user">{user.name || user.email}</div>
           </div>
-          <button className="ghost-btn" type="button" onClick={onLogout}>
+          <button className="admin-logout-btn" type="button" onClick={onLogout} title="退出登录" aria-label="退出登录">
             <LogOut size={16} />
-            退出
+            <span>退出</span>
           </button>
         </div>
         <nav className="admin-nav" aria-label="后台分类">
-          <button className={'admin-nav-item ' + (activeTab === 'overview' ? 'active' : '')} type="button" onClick={() => setActiveTab('overview')}>
+          <button className={'admin-nav-item ' + (activeTab === 'overview' ? 'active' : '')} type="button" onClick={() => selectTab('overview')}>
             <LayoutDashboard size={16} />
             概览
           </button>
-          <button className={'admin-nav-item ' + (activeTab === 'models' ? 'active' : '')} type="button" onClick={() => setActiveTab('models')}>
+          <button className={'admin-nav-item ' + (activeTab === 'models' ? 'active' : '')} type="button" onClick={() => selectTab('models')}>
             <Settings size={16} />
             模型
           </button>
-          <button className={'admin-nav-item ' + (activeTab === 'tools' ? 'active' : '')} type="button" onClick={() => setActiveTab('tools')}>
+          <button className={'admin-nav-item ' + (activeTab === 'tools' ? 'active' : '')} type="button" onClick={() => selectTab('tools')}>
             <Wrench size={16} />
             工具
           </button>
-          <button className={'admin-nav-item ' + (activeTab === 'memory' ? 'active' : '')} type="button" onClick={() => setActiveTab('memory')}>
+          <button className={'admin-nav-item ' + (activeTab === 'memory' ? 'active' : '')} type="button" onClick={() => selectTab('memory')}>
             <BookMarked size={16} />
             记忆
           </button>
-          <button className={'admin-nav-item ' + (activeTab === 'runtime' ? 'active' : '')} type="button" onClick={() => setActiveTab('runtime')}>
+          <button className={'admin-nav-item ' + (activeTab === 'runtime' ? 'active' : '')} type="button" onClick={() => selectTab('runtime')}>
             <Activity size={16} />
             运行
           </button>
         </nav>
       </aside>
+      <button className="admin-sidebar-backdrop" type="button" aria-label="关闭后台侧边栏" onClick={() => setMobileSidebarOpen(false)} />
       <section className="admin-main">
+        <header className="admin-mobile-bar">
+          <button className="admin-mobile-menu-btn" type="button" onClick={() => setMobileSidebarOpen(true)} aria-label="打开后台侧边栏">
+            <Menu size={19} />
+          </button>
+          <div>
+            <strong>{activeTabTitle}</strong>
+            <span>后台管理</span>
+          </div>
+        </header>
         <header className="admin-header">
           <h1>后台管理</h1>
           <p>/admin</p>
@@ -2967,7 +3009,7 @@ function AdminDashboard({ user, onLogout }: { user: User; onLogout: () => void }
         ) : activeTab === 'tools' ? (
           <UniFuncsPanel settings={adminSettings} onChanged={refreshSettings} />
         ) : activeTab === 'memory' ? (
-          <MemorySettingsPanel providers={providers} settings={adminSettings} onChanged={refreshSettings} />
+          <MemorySettingsPanel providers={providers} settings={adminSettings} onChanged={refreshSettings} onProvidersChanged={refreshProviders} />
         ) : (
           <UsagePanel />
         )}
@@ -3031,10 +3073,10 @@ function OverviewPanel({ providers, settings, onNavigate }: { providers: Provide
           </div>
           <div>
             <span>对话标题 LLM</span>
-            <strong>{titleProvider ? `${titleProvider.name} · ${titleProvider.model}` : '复用记忆 LLM'}</strong>
+            <strong>{titleProvider ? `${titleProvider.name} · ${titleProvider.model}` : '未配置'}</strong>
           </div>
           <div>
-            <span>Embedding Provider</span>
+            <span>向量化 LLM</span>
             <strong>{embeddingProvider ? `${embeddingProvider.name} · ${embeddingProvider.model}` : '未配置'}</strong>
           </div>
           <div>
@@ -3083,17 +3125,20 @@ function UsagePanel() {
 function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onChanged: () => Promise<void> | void }) {
   const [form, setForm] = useState<AdminSettings>(settings);
   const [error, setError] = useState('');
+  const [searchModalOpen, setSearchModalOpen] = useState(false);
+  const [imageModalOpen, setImageModalOpen] = useState(false);
 
   useEffect(() => {
     setForm(settings);
   }, [settings]);
 
-  async function save(event: React.FormEvent) {
+  async function save(event: React.FormEvent, onDone?: () => void) {
     event.preventDefault();
     setError('');
     try {
       await api.updateAdminSettings(form);
       await onChanged();
+      onDone?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');
     }
@@ -3110,17 +3155,18 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
     }
   }
 
-  async function copySearchingToImageTool() {
-    const nextForm = {
-      ...form,
-      image_tool_base_url: form.searching_base_url,
-      image_tool_api_key: form.searching_api_key
-    };
-    await saveForm(nextForm);
-  }
-
   const mode = form.search_tool_mode === 'searching' ? 'searching' : 'unifuncs';
   const imageMode = form.image_tool_mode === 'responses' || form.image_tool_mode === 'chat_completions' ? form.image_tool_mode : 'image_api';
+  const searchModeLabel = mode === 'unifuncs' ? 'UniFuncs 联动' : 'Searching LLM';
+  const searchEndpoint = mode === 'unifuncs' ? form.unifuncs_base_url : form.searching_base_url;
+  const searchModel = mode === 'unifuncs' ? 'web_search / web_reader' : form.searching_model || '未填写';
+  const imageModeLabel = imageMode === 'responses' ? 'Responses' : imageMode === 'chat_completions' ? 'Chat Completions' : 'Image API';
+  const imageModelLabel =
+    imageMode === 'responses'
+      ? form.image_responses_model || '未填写'
+      : imageMode === 'chat_completions'
+        ? form.image_chat_model || '未填写'
+        : `${form.image_generate_model || '未填写'} / ${form.image_edit_model || '未填写'}`;
 
   return (
     <div className="admin-panel">
@@ -3148,194 +3194,63 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
           </button>
         </div>
       </section>
-      <form className="settings-grid admin-section-card" onSubmit={save}>
+      {error && !searchModalOpen && !imageModalOpen && <div className="admin-error-banner">{error}</div>}
+      <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
-            <h2>{mode === 'unifuncs' ? 'UniFuncs Web Search + Web Reader' : 'Searching LLM API'}</h2>
-            <p>
-              {mode === 'unifuncs'
-                ? '当前只启用 web_search 和 web_reader，searching 不可使用。'
-                : '当前只启用 searching，web_search 和 web_reader 不可使用。'}
-            </p>
+            <h2>搜索工具配置</h2>
+            <p>当前对话工具只展示关键状态，完整密钥和参数通过弹窗维护。</p>
           </div>
-        </div>
-        {mode === 'unifuncs' ? (
-          <>
-            <input
-              placeholder="UniFuncs API Key"
-              value={form.unifuncs_api_key}
-              onChange={(event) => setForm({ ...form, unifuncs_api_key: event.target.value })}
-            />
-            <input
-              placeholder="UniFuncs Base URL，例如 https://api.unifuncs.com 或 https://api.unifuncs.com/api"
-              value={form.unifuncs_base_url}
-              onChange={(event) => setForm({ ...form, unifuncs_base_url: event.target.value })}
-            />
-            <label className="settings-field">
-              <span>搜索卡片显示条数</span>
-              <select
-                value={form.web_search_card_result_count || '4'}
-                onChange={(event) => void saveForm({ ...form, web_search_card_result_count: event.target.value })}
-              >
-                <option value="2">2 条</option>
-                <option value="4">4 条</option>
-                <option value="6">6 条</option>
-                <option value="10">10 条</option>
-              </select>
-            </label>
-            <p className="field-help">切换到 Searching LLM 后，这套配置会保留，但 web_search 和 web_reader 不会被提供给模型。</p>
-          </>
-        ) : (
-          <>
-            <input
-              placeholder="Searching Base URL，例如 https://api.example.com 或 https://api.example.com/v1"
-              value={form.searching_base_url}
-              onChange={(event) => setForm({ ...form, searching_base_url: event.target.value })}
-            />
-            <input
-              placeholder="Searching API Key"
-              value={form.searching_api_key}
-              onChange={(event) => setForm({ ...form, searching_api_key: event.target.value })}
-            />
-            <input
-              placeholder="Searching Model"
-              value={form.searching_model}
-              onChange={(event) => setForm({ ...form, searching_model: event.target.value })}
-            />
-            <input
-              placeholder="ID / API ID，可选"
-              value={form.searching_api_id}
-              onChange={(event) => setForm({ ...form, searching_api_id: event.target.value })}
-            />
-            <p className="field-help">切换回 UniFuncs 后，这套配置会保留，但 searching 不会被提供给模型。</p>
-          </>
-        )}
-        {error && <div className="error-line">{error}</div>}
-        <div className="provider-form-actions">
-          <button className="primary-btn" type="submit">
-            保存搜索工具配置
+          <button className="primary-btn" type="button" onClick={() => { setError(''); setSearchModalOpen(true); }}>
+            <Settings size={16} />
+            配置搜索工具
           </button>
         </div>
-      </form>
-      <form className="settings-grid admin-section-card" onSubmit={save}>
+        <div className="admin-summary-list">
+          <div>
+            <span>当前模式</span>
+            <strong>{searchModeLabel}</strong>
+          </div>
+          <div>
+            <span>接口地址</span>
+            <strong>{searchEndpoint || '未填写 Base URL'}</strong>
+          </div>
+          <div>
+            <span>模型 / 能力</span>
+            <strong>{searchModel}</strong>
+          </div>
+          <div>
+            <span>搜索卡片</span>
+            <strong>{form.web_search_card_result_count || '4'} 条</strong>
+          </div>
+        </div>
+      </section>
+      <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
-            <h2>图片工具</h2>
-            <p>配置主 LLM 可调用的 image_generate 和 image_edit。</p>
+            <h2>图片工具配置</h2>
+            <p>image_generate 和 image_edit 的接口、模型、尺寸和返回格式都在弹窗里维护。</p>
           </div>
-          <button className="text-btn" type="button" onClick={() => void copySearchingToImageTool()}>
-            复制 Searching 配置
+          <button className="primary-btn" type="button" onClick={() => { setError(''); setImageModalOpen(true); }}>
+            <Settings size={16} />
+            配置图片工具
           </button>
         </div>
-        <div className="tool-mode-switch" role="group" aria-label="图片工具模式">
-          <button
-            className={'tool-mode-switch__item ' + (imageMode === 'image_api' ? 'active' : '')}
-            type="button"
-            onClick={() => setForm({ ...form, image_tool_mode: 'image_api' })}
-          >
-            Image API
-          </button>
-          <button
-            className={'tool-mode-switch__item ' + (imageMode === 'responses' ? 'active' : '')}
-            type="button"
-            onClick={() => setForm({ ...form, image_tool_mode: 'responses' })}
-          >
-            Responses
-          </button>
-          <button
-            className={'tool-mode-switch__item ' + (imageMode === 'chat_completions' ? 'active' : '')}
-            type="button"
-            onClick={() => setForm({ ...form, image_tool_mode: 'chat_completions' })}
-          >
-            Chat Completions
-          </button>
-        </div>
-        <input
-          placeholder="图片工具 Base URL，例如 https://api.tu-zi.com"
-          value={form.image_tool_base_url}
-          onChange={(event) => setForm({ ...form, image_tool_base_url: event.target.value })}
-        />
-        <input
-          placeholder="图片工具 API Key"
-          value={form.image_tool_api_key}
-          onChange={(event) => setForm({ ...form, image_tool_api_key: event.target.value })}
-        />
-        {imageMode === 'image_api' && (
-          <div className="admin-field-grid">
-            <label className="field-block">
-              生图模型
-              <select value={form.image_generate_model} onChange={(event) => setForm({ ...form, image_generate_model: event.target.value })}>
-                <option value="gpt-image-2">gpt-image-2</option>
-                <option value="gpt-image-1.5">gpt-image-1.5</option>
-                <option value="gpt-image-1">gpt-image-1</option>
-                <option value="gpt-4o-image-vip">gpt-4o-image-vip</option>
-                <option value="gpt-4o-image">gpt-4o-image</option>
-              </select>
-            </label>
-            <label className="field-block">
-              编辑模型
-              <select value={form.image_edit_model} onChange={(event) => setForm({ ...form, image_edit_model: event.target.value })}>
-                <option value="gpt-image-1.5">gpt-image-1.5</option>
-                <option value="gpt-image-2">gpt-image-2</option>
-                <option value="gpt-image-1">gpt-image-1</option>
-                <option value="gpt-4o-image-vip">gpt-4o-image-vip</option>
-                <option value="gpt-4o-image">gpt-4o-image</option>
-              </select>
-            </label>
+        <div className="admin-summary-list admin-summary-list--compact">
+          <div>
+            <span>调用模式</span>
+            <strong>{imageModeLabel}</strong>
           </div>
-        )}
-        {imageMode === 'responses' && (
-          <label className="field-block">
-            Responses 模型
-            <input value={form.image_responses_model} onChange={(event) => setForm({ ...form, image_responses_model: event.target.value })} />
-          </label>
-        )}
-        {imageMode === 'chat_completions' && (
-          <label className="field-block">
-            Chat Completions 模型
-            <input value={form.image_chat_model} onChange={(event) => setForm({ ...form, image_chat_model: event.target.value })} />
-          </label>
-        )}
-        <div className="admin-field-grid">
-          <label className="field-block">
-            生图默认尺寸
-            <input value={form.image_default_size} onChange={(event) => setForm({ ...form, image_default_size: event.target.value })} />
-          </label>
-          <label className="field-block">
-            编辑默认尺寸
-            <select value={form.image_edit_size} onChange={(event) => setForm({ ...form, image_edit_size: event.target.value })}>
-              <option value="1:1">1:1</option>
-              <option value="2:3">2:3</option>
-              <option value="3:2">3:2</option>
-            </select>
-          </label>
+          <div>
+            <span>接口地址</span>
+            <strong>{form.image_tool_base_url || '未填写 Base URL'}</strong>
+          </div>
+          <div>
+            <span>模型</span>
+            <strong>{imageModelLabel}</strong>
+          </div>
         </div>
-        <div className="admin-field-grid">
-          <label className="field-block">
-            默认质量
-            <select value={form.image_default_quality} onChange={(event) => setForm({ ...form, image_default_quality: event.target.value })}>
-              <option value="auto">auto</option>
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-            </select>
-          </label>
-          <label className="field-block">
-            返回格式
-            <select value={form.image_response_format} onChange={(event) => setForm({ ...form, image_response_format: event.target.value })}>
-              <option value="url">url</option>
-              <option value="b64_json">b64_json</option>
-            </select>
-          </label>
-        </div>
-        <p className="field-help">复制 Searching 配置只是把已有 URL/Key 抄到图片工具配置里用于测试；image_generate 和 image_edit 仍然调用独立图片接口。</p>
-        {error && <div className="error-line">{error}</div>}
-        <div className="provider-form-actions">
-          <button className="primary-btn" type="submit">
-            保存图片工具配置
-          </button>
-        </div>
-      </form>
+      </section>
       <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
@@ -3351,6 +3266,215 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
           <span>image_edit</span>
         </div>
       </section>
+      {searchModalOpen && (
+        <Modal title={mode === 'unifuncs' ? '配置 UniFuncs 工具' : '配置 Searching LLM'} onClose={() => setSearchModalOpen(false)} className="admin-modal-card">
+          <form className="settings-grid admin-modal-form" onSubmit={(event) => void save(event, () => setSearchModalOpen(false))}>
+            <div className="provider-form-head">
+              <div>
+                <h2>{mode === 'unifuncs' ? 'UniFuncs Web Search + Web Reader' : 'Searching LLM API'}</h2>
+                <p>
+                  {mode === 'unifuncs'
+                    ? '当前只启用 web_search 和 web_reader，searching 不可使用。'
+                    : '当前只启用 searching，web_search 和 web_reader 不可使用。'}
+                </p>
+              </div>
+            </div>
+            {mode === 'unifuncs' ? (
+              <>
+                <input
+                  placeholder="UniFuncs API Key"
+                  value={form.unifuncs_api_key}
+                  onChange={(event) => setForm({ ...form, unifuncs_api_key: event.target.value })}
+                />
+                <input
+                  placeholder="UniFuncs Base URL，例如 https://api.unifuncs.com 或 https://api.unifuncs.com/api"
+                  value={form.unifuncs_base_url}
+                  onChange={(event) => setForm({ ...form, unifuncs_base_url: event.target.value })}
+                />
+                <label className="settings-field">
+                  <span>搜索卡片显示条数</span>
+                  <select
+                    value={form.web_search_card_result_count || '4'}
+                    onChange={(event) => void saveForm({ ...form, web_search_card_result_count: event.target.value })}
+                  >
+                    <option value="2">2 条</option>
+                    <option value="4">4 条</option>
+                    <option value="6">6 条</option>
+                    <option value="10">10 条</option>
+                  </select>
+                </label>
+                <p className="field-help">切换到 Searching LLM 后，这套配置会保留，但 web_search 和 web_reader 不会被提供给模型。</p>
+              </>
+            ) : (
+              <>
+                <input
+                  placeholder="Searching Base URL，例如 https://api.example.com 或 https://api.example.com/v1"
+                  value={form.searching_base_url}
+                  onChange={(event) => setForm({ ...form, searching_base_url: event.target.value })}
+                />
+                <input
+                  placeholder="Searching API Key"
+                  value={form.searching_api_key}
+                  onChange={(event) => setForm({ ...form, searching_api_key: event.target.value })}
+                />
+                <input
+                  placeholder="Searching Model"
+                  value={form.searching_model}
+                  onChange={(event) => setForm({ ...form, searching_model: event.target.value })}
+                />
+                <input
+                  placeholder="ID / API ID，可选"
+                  value={form.searching_api_id}
+                  onChange={(event) => setForm({ ...form, searching_api_id: event.target.value })}
+                />
+                <p className="field-help">切换回 UniFuncs 后，这套配置会保留，但 searching 不会被提供给模型。</p>
+              </>
+            )}
+            {error && <div className="error-line">{error}</div>}
+            <div className="provider-form-actions">
+              <button className="primary-btn" type="submit">
+                <Check size={16} />
+                保存搜索工具配置
+              </button>
+              <button className="text-btn" type="button" onClick={() => setSearchModalOpen(false)}>
+                取消
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {imageModalOpen && (
+        <Modal title="配置图片工具" onClose={() => setImageModalOpen(false)} className="admin-modal-card">
+          <form className="settings-grid admin-modal-form" onSubmit={(event) => void save(event, () => setImageModalOpen(false))}>
+            <div className="provider-form-head">
+              <div>
+                <h2>图片工具</h2>
+                <p>配置主 LLM 可调用的 image_generate 和 image_edit。</p>
+              </div>
+            </div>
+            <div className="tool-mode-switch tool-mode-switch--three" role="group" aria-label="图片工具模式">
+              <button
+                className={'tool-mode-switch__item ' + (imageMode === 'image_api' ? 'active' : '')}
+                type="button"
+                onClick={() => setForm({ ...form, image_tool_mode: 'image_api' })}
+              >
+                Image API
+              </button>
+              <button
+                className={'tool-mode-switch__item ' + (imageMode === 'responses' ? 'active' : '')}
+                type="button"
+                onClick={() => setForm({ ...form, image_tool_mode: 'responses' })}
+              >
+                Responses
+              </button>
+              <button
+                className={'tool-mode-switch__item ' + (imageMode === 'chat_completions' ? 'active' : '')}
+                type="button"
+                onClick={() => setForm({ ...form, image_tool_mode: 'chat_completions' })}
+              >
+                Chat Completions
+              </button>
+            </div>
+            <label className="field-block image-mode-select">
+              接口模式
+              <select value={imageMode} onChange={(event) => setForm({ ...form, image_tool_mode: event.target.value })}>
+                <option value="image_api">Image API</option>
+                <option value="responses">Responses</option>
+                <option value="chat_completions">Chat Completions</option>
+              </select>
+            </label>
+            <input
+              placeholder="图片工具 Base URL，例如 https://api.tu-zi.com"
+              value={form.image_tool_base_url}
+              onChange={(event) => setForm({ ...form, image_tool_base_url: event.target.value })}
+            />
+            <input
+              placeholder="图片工具 API Key"
+              value={form.image_tool_api_key}
+              onChange={(event) => setForm({ ...form, image_tool_api_key: event.target.value })}
+            />
+            {imageMode === 'image_api' && (
+              <div className="admin-field-grid">
+                <label className="field-block">
+                  生图模型
+                  <select value={form.image_generate_model} onChange={(event) => setForm({ ...form, image_generate_model: event.target.value })}>
+                    <option value="gpt-image-2">gpt-image-2</option>
+                    <option value="gpt-image-1.5">gpt-image-1.5</option>
+                    <option value="gpt-image-1">gpt-image-1</option>
+                    <option value="gpt-4o-image-vip">gpt-4o-image-vip</option>
+                    <option value="gpt-4o-image">gpt-4o-image</option>
+                  </select>
+                </label>
+                <label className="field-block">
+                  编辑模型
+                  <select value={form.image_edit_model} onChange={(event) => setForm({ ...form, image_edit_model: event.target.value })}>
+                    <option value="gpt-image-1.5">gpt-image-1.5</option>
+                    <option value="gpt-image-2">gpt-image-2</option>
+                    <option value="gpt-image-1">gpt-image-1</option>
+                    <option value="gpt-4o-image-vip">gpt-4o-image-vip</option>
+                    <option value="gpt-4o-image">gpt-4o-image</option>
+                  </select>
+                </label>
+              </div>
+            )}
+            {imageMode === 'responses' && (
+              <label className="field-block">
+                Responses 模型
+                <input value={form.image_responses_model} onChange={(event) => setForm({ ...form, image_responses_model: event.target.value })} />
+              </label>
+            )}
+            {imageMode === 'chat_completions' && (
+              <label className="field-block">
+                Chat Completions 模型
+                <input value={form.image_chat_model} onChange={(event) => setForm({ ...form, image_chat_model: event.target.value })} />
+              </label>
+            )}
+            <div className="admin-field-grid">
+              <label className="field-block">
+                生图默认尺寸
+                <input value={form.image_default_size} onChange={(event) => setForm({ ...form, image_default_size: event.target.value })} />
+              </label>
+              <label className="field-block">
+                编辑默认尺寸
+                <select value={form.image_edit_size} onChange={(event) => setForm({ ...form, image_edit_size: event.target.value })}>
+                  <option value="1:1">1:1</option>
+                  <option value="2:3">2:3</option>
+                  <option value="3:2">3:2</option>
+                </select>
+              </label>
+            </div>
+            <div className="admin-field-grid">
+              <label className="field-block">
+                默认质量
+                <select value={form.image_default_quality} onChange={(event) => setForm({ ...form, image_default_quality: event.target.value })}>
+                  <option value="auto">auto</option>
+                  <option value="low">low</option>
+                  <option value="medium">medium</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <label className="field-block">
+                返回格式
+                <select value={form.image_response_format} onChange={(event) => setForm({ ...form, image_response_format: event.target.value })}>
+                  <option value="url">url</option>
+                  <option value="b64_json">b64_json</option>
+                </select>
+              </label>
+            </div>
+            <p className="field-help">image_generate 和 image_edit 使用这里配置的独立图片接口。</p>
+            {error && <div className="error-line">{error}</div>}
+            <div className="provider-form-actions">
+              <button className="primary-btn" type="submit">
+                <Check size={16} />
+                保存图片工具配置
+              </button>
+              <button className="text-btn" type="button" onClick={() => setImageModalOpen(false)}>
+                取消
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -3358,14 +3482,21 @@ function UniFuncsPanel({ settings, onChanged }: { settings: AdminSettings; onCha
 function MemorySettingsPanel({
   providers,
   settings,
-  onChanged
+  onChanged,
+  onProvidersChanged
 }: {
   providers: Provider[];
   settings: AdminSettings;
   onChanged: () => Promise<void> | void;
+  onProvidersChanged: () => Promise<void> | void;
 }) {
   const [form, setForm] = useState<AdminSettings>(settings);
+  const [llmForm, setLlmForm] = useState<ProviderFormState>(emptyProviderForm);
+  const [editingFeature, setEditingFeature] = useState<'memory' | 'embedding' | null>(null);
+  const [editingProviderId, setEditingProviderId] = useState<number | null>(null);
   const [error, setError] = useState('');
+  const [configModalOpen, setConfigModalOpen] = useState(false);
+  const [llmModalOpen, setLlmModalOpen] = useState(false);
 
   useEffect(() => {
     setForm(settings);
@@ -3377,73 +3508,267 @@ function MemorySettingsPanel({
     try {
       await api.updateAdminSettings(form);
       await onChanged();
+      setConfigModalOpen(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');
     }
   }
 
+  function configureMemoryProvider() {
+    const provider = providers.find((item) => String(item.id) === form.memory_provider_id);
+    setError('');
+    setEditingFeature('memory');
+    setEditingProviderId(provider?.id || null);
+    setLlmForm(
+      provider
+        ? providerFormFromProvider(provider, { name: provider.name || '记忆 LLM', is_default: false, is_visible: false, is_active: true })
+        : { ...emptyProviderForm, name: '记忆 LLM', is_default: false, is_visible: false, is_active: true }
+    );
+    setLlmModalOpen(true);
+  }
+
+  function configureEmbeddingProvider() {
+    const provider = providers.find((item) => String(item.id) === form.embedding_provider_id);
+    setError('');
+    setEditingFeature('embedding');
+    setEditingProviderId(provider?.id || null);
+    setLlmForm(
+      provider
+        ? providerFormFromProvider(provider, { name: provider.name || '向量化 LLM', is_default: false, is_visible: false, is_active: true })
+        : { ...emptyProviderForm, name: '向量化 LLM', is_default: false, is_visible: false, is_active: true }
+    );
+    setLlmModalOpen(true);
+  }
+
+  function closeLlmModal() {
+    setLlmModalOpen(false);
+    setEditingFeature(null);
+    setEditingProviderId(null);
+    setLlmForm(emptyProviderForm);
+    setError('');
+  }
+
+  async function saveLlm(event: React.FormEvent) {
+    event.preventDefault();
+    if (!editingFeature) return;
+    setError('');
+    try {
+      const payload = providerPayloadFromForm({
+        ...llmForm,
+        is_default: false,
+        is_visible: false,
+        is_active: true
+      });
+      const res = editingProviderId ? await api.updateProvider(editingProviderId, payload) : await api.createProvider(payload);
+      const providerID = String(res.provider.id);
+      const nextForm =
+        editingFeature === 'memory'
+          ? { ...form, memory_provider_id: providerID }
+          : { ...form, embedding_provider_id: providerID };
+      setForm(nextForm);
+      await api.updateAdminSettings(nextForm);
+      await onChanged();
+      await onProvidersChanged();
+      closeLlmModal();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存失败');
+    }
+  }
+
+  const memoryProvider = providers.find((provider) => String(provider.id) === form.memory_provider_id);
+  const embeddingProvider = providers.find((provider) => String(provider.id) === form.embedding_provider_id);
+  const memoryReady = Boolean(memoryProvider && embeddingProvider);
+  const llmModalTitle = editingFeature === 'embedding' ? '配置向量化 LLM' : '配置记忆 LLM';
+
   return (
     <div className="admin-panel">
-      <form className="settings-grid admin-section-card" onSubmit={save}>
+      {error && !configModalOpen && !llmModalOpen && <div className="admin-error-banner">{error}</div>}
+      <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
             <h2>自动长期记忆</h2>
             <p>回复完成后由记忆模型自动判断新增、更新或忽略，并用 Embedding 模型检索相关记忆注入上下文。</p>
           </div>
         </div>
-        <label className="field-block">
-          记忆 LLM
-          <select value={form.memory_provider_id} onChange={(event) => setForm({ ...form, memory_provider_id: event.target.value })}>
-            <option value="0">未配置</option>
-            {providers.map((provider) => (
-              <option value={String(provider.id)} key={provider.id}>
-                {provider.name} · {provider.model}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="field-block">
-          Embedding Provider
-          <select value={form.embedding_provider_id} onChange={(event) => setForm({ ...form, embedding_provider_id: event.target.value })}>
-            <option value="0">未配置</option>
-            {providers.map((provider) => (
-              <option value={String(provider.id)} key={provider.id}>
-                {provider.name} · {provider.model}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="admin-form-divider" />
+        <div className="admin-summary-list admin-summary-list--compact">
+          <div>
+            <span>状态</span>
+            <strong>{memoryReady ? '可用' : '未完整配置'}</strong>
+          </div>
+          <div>
+            <span>记忆 LLM</span>
+            <strong>{memoryProvider ? `${memoryProvider.name} · ${memoryProvider.model}` : '未配置'}</strong>
+          </div>
+          <div>
+            <span>向量化 LLM</span>
+            <strong>{embeddingProvider ? `${embeddingProvider.name} · ${embeddingProvider.model}` : '未配置'}</strong>
+          </div>
+        </div>
+      </section>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>记忆 LLM</h2>
+            <p>专门负责判断对话里哪些内容要写入长期记忆。</p>
+          </div>
+          <button className="primary-btn" type="button" onClick={configureMemoryProvider}>
+            <Settings size={16} />
+            配置记忆 LLM
+          </button>
+        </div>
+        <div className="admin-summary-list">
+          <div>
+            <span>当前配置</span>
+            <strong>{memoryProvider ? `${memoryProvider.name} · ${memoryProvider.model}` : '未配置'}</strong>
+          </div>
+          <div>
+            <span>接口地址</span>
+            <strong>{memoryProvider?.base_url || '未填写 Base URL'}</strong>
+          </div>
+        </div>
+      </section>
+      <section className="admin-section-card">
+        <div className="provider-form-head">
+          <div>
+            <h2>向量化 LLM</h2>
+            <p>专门负责把记忆内容向量化，用于后续相似度检索。</p>
+          </div>
+          <button className="primary-btn" type="button" onClick={configureEmbeddingProvider}>
+            <Settings size={16} />
+            配置向量化 LLM
+          </button>
+        </div>
+        <div className="admin-summary-list">
+          <div>
+            <span>当前配置</span>
+            <strong>{embeddingProvider ? `${embeddingProvider.name} · ${embeddingProvider.model}` : '未配置'}</strong>
+          </div>
+          <div>
+            <span>接口地址</span>
+            <strong>{embeddingProvider?.base_url || '未填写 Base URL'}</strong>
+          </div>
+        </div>
+      </section>
+      <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
             <h2>写入与检索限制</h2>
-            <p>控制记忆模型每次看多少上下文，以及单轮最多产生多少记忆动作。</p>
+            <p>当前限制只展示概要，具体数值可在记忆配置弹窗中调整。</p>
           </div>
-        </div>
-        <label className="field-block">
-          记忆模型查看的最近消息数
-          <input value={form.memory_recent_message_limit} onChange={(event) => setForm({ ...form, memory_recent_message_limit: event.target.value })} />
-        </label>
-        <label className="field-block">
-          单轮最多记忆动作
-          <input value={form.memory_max_actions_per_run} onChange={(event) => setForm({ ...form, memory_max_actions_per_run: event.target.value })} />
-        </label>
-        <label className="field-block">
-          注入记忆上限
-          <input value={form.memory_inject_limit} onChange={(event) => setForm({ ...form, memory_inject_limit: event.target.value })} />
-        </label>
-        <label className="field-block">
-          Embedding 检索 Top K
-          <input value={form.embedding_top_k} onChange={(event) => setForm({ ...form, embedding_top_k: event.target.value })} />
-        </label>
-        <p className="field-help">用户提问时固定注入向量相似度最高的 10 条记忆；未配置记忆 LLM 时不会自动写入记忆，未配置 Embedding 时不会注入长期记忆。</p>
-        {error && <div className="error-line">{error}</div>}
-        <div className="provider-form-actions">
-          <button className="primary-btn" type="submit">
-            保存记忆配置
+          <button className="primary-btn" type="button" onClick={() => { setError(''); setConfigModalOpen(true); }}>
+            <Settings size={16} />
+            配置限制
           </button>
         </div>
-      </form>
+        <div className="admin-summary-list admin-summary-list--compact admin-summary-list--four">
+          <div>
+            <span>最近消息</span>
+            <strong>{form.memory_recent_message_limit || '12'} 条</strong>
+          </div>
+          <div>
+            <span>单轮动作</span>
+            <strong>{form.memory_max_actions_per_run || '5'} 个</strong>
+          </div>
+          <div>
+            <span>注入上限</span>
+            <strong>{form.memory_inject_limit || '20'} 条</strong>
+          </div>
+          <div>
+            <span>Top K</span>
+            <strong>{form.embedding_top_k || '8'}</strong>
+          </div>
+        </div>
+      </section>
+      {configModalOpen && (
+        <Modal title="配置自动长期记忆" onClose={() => setConfigModalOpen(false)} className="admin-modal-card">
+          <form className="settings-grid admin-modal-form" onSubmit={save}>
+            <div className="provider-form-head">
+              <div>
+                <h2>写入与检索限制</h2>
+                <p>控制记忆模型每次看多少上下文，以及单轮最多产生多少记忆动作。</p>
+              </div>
+            </div>
+            <label className="field-block">
+              记忆模型查看的最近消息数
+              <input value={form.memory_recent_message_limit} onChange={(event) => setForm({ ...form, memory_recent_message_limit: event.target.value })} />
+            </label>
+            <label className="field-block">
+              单轮最多记忆动作
+              <input value={form.memory_max_actions_per_run} onChange={(event) => setForm({ ...form, memory_max_actions_per_run: event.target.value })} />
+            </label>
+            <label className="field-block">
+              注入记忆上限
+              <input value={form.memory_inject_limit} onChange={(event) => setForm({ ...form, memory_inject_limit: event.target.value })} />
+            </label>
+            <label className="field-block">
+              Embedding 检索 Top K
+              <input value={form.embedding_top_k} onChange={(event) => setForm({ ...form, embedding_top_k: event.target.value })} />
+            </label>
+            <p className="field-help">用户提问时固定注入向量相似度最高的 10 条记忆；未配置记忆 LLM 时不会自动写入记忆，未配置 Embedding 时不会注入长期记忆。</p>
+            {error && <div className="error-line">{error}</div>}
+            <div className="provider-form-actions">
+              <button className="primary-btn" type="submit">
+                <Check size={16} />
+                保存记忆配置
+              </button>
+              <button className="text-btn" type="button" onClick={() => setConfigModalOpen(false)}>
+                取消
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {llmModalOpen && (
+        <Modal title={llmModalTitle} onClose={closeLlmModal} className="admin-modal-card">
+          <form className="settings-grid admin-modal-form" onSubmit={saveLlm}>
+            <div className="provider-form-head">
+              <div>
+                <h2>{llmModalTitle}</h2>
+                <p>这里保存的是这个功能自己的独立 LLM 配置，API Key 留空时会沿用原来的密钥。</p>
+              </div>
+            </div>
+            <input placeholder="名称" value={llmForm.name} onChange={(event) => setLlmForm({ ...llmForm, name: event.target.value })} />
+            <input
+              placeholder="Base URL，例如 https://api.openai.com/v1"
+              value={llmForm.base_url}
+              onChange={(event) => setLlmForm({ ...llmForm, base_url: event.target.value })}
+            />
+            <input
+              placeholder={editingProviderId ? 'API Key，留空则不修改' : 'API Key'}
+              value={llmForm.api_key}
+              onChange={(event) => setLlmForm({ ...llmForm, api_key: event.target.value })}
+            />
+            <input placeholder="模型" value={llmForm.model} onChange={(event) => setLlmForm({ ...llmForm, model: event.target.value })} />
+            <label className="field-block">
+              请求接口
+              <select value={llmForm.request_mode} onChange={(event) => setLlmForm({ ...llmForm, request_mode: event.target.value })}>
+                <option value="chat_completions">chat/completions</option>
+                <option value="responses">responses</option>
+              </select>
+            </label>
+            <label className="field-block">
+              response_format
+              <textarea
+                rows={4}
+                placeholder='例如 {"type":"json_object"}'
+                value={llmForm.response_format}
+                onChange={(event) => setLlmForm({ ...llmForm, response_format: event.target.value })}
+              />
+            </label>
+            <p className="field-help">这个配置不会出现在前台模型选择里，只给当前功能内部调用。</p>
+            {error && <div className="error-line">{error}</div>}
+            <div className="provider-form-actions">
+              <button className="primary-btn" type="submit">
+                <Check size={16} />
+                保存配置
+              </button>
+              <button className="text-btn" type="button" onClick={closeLlmModal}>
+                取消
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 }
@@ -3462,12 +3787,17 @@ function ProviderPanel({
   const [form, setForm] = useState<ProviderFormState>(emptyProviderForm);
   const [settingsForm, setSettingsForm] = useState<AdminSettings>(settings);
   const [editingProviderId, setEditingProviderId] = useState<number | null>(null);
+  const [editingFeature, setEditingFeature] = useState<'chat' | 'title' | null>(null);
   const [error, setError] = useState('');
+  const [providerModalOpen, setProviderModalOpen] = useState(false);
 
   const editingProvider = providers.find((provider) => provider.id === editingProviderId);
   const defaultProvider = providers.find((provider) => provider.is_default);
+  const titleProvider = providers.find((provider) => String(provider.id) === settingsForm.title_provider_id);
+  const chatProviders = providers.filter((provider) => provider.is_visible);
   const visibleProviderCount = providers.filter((provider) => provider.is_visible).length;
-  const activeProviderCount = providers.filter((provider) => provider.is_active).length;
+  const activeProviderCount = providers.filter((provider) => provider.is_visible && provider.is_active).length;
+  const providerModalLabel = editingFeature === 'title' ? '对话标题 LLM' : '主聊天 LLM';
 
   useEffect(() => {
     setSettingsForm(settings);
@@ -3476,40 +3806,68 @@ function ProviderPanel({
   function resetForm() {
     setForm(emptyProviderForm);
     setEditingProviderId(null);
+    setEditingFeature(null);
     setError('');
   }
 
-  function editProvider(provider: Provider) {
-    setEditingProviderId(provider.id);
+  function closeProviderModal() {
+    resetForm();
+    setProviderModalOpen(false);
+  }
+
+  function configureChatProvider() {
     setError('');
-    setForm({
-      name: provider.name,
-      base_url: provider.base_url,
-      api_key: '',
-      model: provider.model,
-      request_mode: provider.request_mode || 'chat_completions',
-      response_format: provider.response_format || '',
-      is_default: provider.is_default,
-      is_visible: provider.is_visible,
-      is_active: provider.is_active
-    });
+    setEditingFeature('chat');
+    setEditingProviderId(null);
+    setForm(
+      { ...emptyProviderForm, name: '主聊天 LLM', is_default: !defaultProvider, is_visible: true, is_active: true }
+    );
+    setProviderModalOpen(true);
+  }
+
+  function configureTitleProvider() {
+    setError('');
+    setEditingFeature('title');
+    setEditingProviderId(titleProvider?.id || null);
+    setForm(
+      titleProvider
+        ? providerFormFromProvider(titleProvider, { name: titleProvider.name || '标题 LLM', is_default: false, is_visible: false, is_active: true })
+        : { ...emptyProviderForm, name: '标题 LLM', is_default: false, is_visible: false, is_active: true }
+    );
+    setProviderModalOpen(true);
   }
 
   async function save(event: React.FormEvent) {
     event.preventDefault();
+    if (!editingFeature) return;
+      setError('');
+    try {
+      const providerForm =
+        editingFeature === 'chat'
+          ? form
+          : { ...form, is_default: false, is_visible: false, is_active: true };
+      const payload = providerPayloadFromForm(providerForm);
+      const res = editingProviderId ? await api.updateProvider(editingProviderId, payload) : await api.createProvider(payload);
+      if (editingFeature === 'title') {
+        const nextForm = { ...settingsForm, title_provider_id: String(res.provider.id) };
+        setSettingsForm(nextForm);
+        await api.updateAdminSettings(nextForm);
+        await onSettingsChanged();
+      }
+      await onChanged();
+      closeProviderModal();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存失败');
+    }
+  }
+
+  async function setDefaultProvider(provider: Provider) {
     setError('');
     try {
-      const payload = {
-        ...form,
-        provider_type: 'openai_compatible',
-        capabilities: DEFAULT_PROVIDER_CAPABILITIES
-      };
-      if (editingProviderId) {
-        await api.updateProvider(editingProviderId, payload);
-      } else {
-        await api.createProvider(payload);
-      }
-      resetForm();
+      await api.updateProvider(
+        provider.id,
+        providerPayloadFromForm(providerFormFromProvider(provider, { is_default: true, is_visible: true, is_active: true }))
+      );
       await onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');
@@ -3521,6 +3879,12 @@ function ProviderPanel({
     setError('');
     try {
       await api.deleteProvider(provider.id);
+      if (provider.is_default) {
+        const fallback = chatProviders.find((item) => item.id !== provider.id && item.is_active);
+        if (fallback) {
+          await setDefaultProvider(fallback);
+        }
+      }
       if (editingProviderId === provider.id) {
         resetForm();
       }
@@ -3530,167 +3894,193 @@ function ProviderPanel({
     }
   }
 
-  async function saveTitleProvider(nextProviderID: string) {
-    const nextForm = { ...settingsForm, title_provider_id: nextProviderID };
-    setSettingsForm(nextForm);
-    setError('');
-    try {
-      await api.updateAdminSettings(nextForm);
-      await onSettingsChanged();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : '保存失败');
-    }
-  }
-
   return (
     <div className="admin-panel">
+      {error && !providerModalOpen && <div className="admin-error-banner">{error}</div>}
       <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
-            <h2>模型状态</h2>
-            <p>这里汇总前台模型选择会直接使用到的 Provider 状态。</p>
+            <h2>主聊天 LLM</h2>
+            <p>这里可以挂很多个主聊天模型，前台会从可见模型里挑默认的那个。</p>
           </div>
+          <button className="primary-btn" type="button" onClick={configureChatProvider}>
+            <Settings size={16} />
+            新增主聊天 LLM
+          </button>
         </div>
         <div className="admin-summary-list admin-summary-list--compact">
           <div>
-            <span>默认模型</span>
+            <span>当前模型</span>
             <strong>{defaultProvider ? `${defaultProvider.name} · ${defaultProvider.model}` : '未设置'}</strong>
           </div>
           <div>
-            <span>前台可见</span>
-            <strong>{visibleProviderCount} 个</strong>
+            <span>接口地址</span>
+            <strong>{defaultProvider?.base_url || '未填写 Base URL'}</strong>
           </div>
           <div>
-            <span>启用模型</span>
-            <strong>{activeProviderCount} 个</strong>
+            <span>前台状态</span>
+            <strong>{defaultProvider?.is_active ? '启用' : '未启用'}</strong>
           </div>
+        </div>
+        <div className="provider-list">
+          {chatProviders.map((provider) => (
+            <div className="provider-card" key={provider.id}>
+              <div className="provider-card__head">
+                <div>
+                  <strong>{provider.name}</strong>
+                  <span>{provider.model}</span>
+                </div>
+                <div className="provider-card__actions">
+                  {!provider.is_default && (
+                    <button className="icon-text-btn" type="button" onClick={() => void setDefaultProvider(provider)}>
+                      <CircleCheck size={15} />
+                      设为默认
+                    </button>
+                  )}
+                  <button
+                    className="icon-text-btn"
+                    type="button"
+                    onClick={() => {
+                      setEditingFeature('chat');
+                      setEditingProviderId(provider.id);
+                      setError('');
+                      setForm(providerFormFromProvider(provider));
+                      setProviderModalOpen(true);
+                    }}
+                  >
+                    <Edit3 size={15} />
+                    编辑
+                  </button>
+                  <button className="icon-text-btn danger" type="button" onClick={() => void deleteProvider(provider)}>
+                    <X size={15} />
+                    删除
+                  </button>
+                </div>
+              </div>
+              <small>{provider.base_url}</small>
+              <div className="provider-badges">
+                <span>{provider.request_mode === 'responses' ? 'responses' : 'chat/completions'}</span>
+                {provider.is_default && <span>默认</span>}
+                {provider.is_visible ? <span>可见</span> : <span>隐藏</span>}
+                {provider.is_active ? <span>启用</span> : <span>停用</span>}
+              </div>
+              {provider.response_format && <small>{provider.response_format}</small>}
+            </div>
+          ))}
+          {!chatProviders.length && <div className="empty-hint">暂无主聊天模型</div>}
         </div>
       </section>
       <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
             <h2>对话标题 LLM</h2>
-            <p>新对话发出第一条消息后，用这个模型根据用户第一条消息生成侧边栏标题；未选择时会复用记忆 LLM。</p>
+            <p>新对话发出第一条消息后，用这个模型根据用户第一条消息生成侧边栏标题。</p>
           </div>
-        </div>
-        <label className="field-block">
-          标题生成模型
-          <select value={settingsForm.title_provider_id} onChange={(event) => void saveTitleProvider(event.target.value)}>
-            <option value="0">未单独配置，复用记忆 LLM</option>
-            {providers.map((provider) => (
-              <option value={String(provider.id)} key={provider.id}>
-                {provider.name} · {provider.model}
-              </option>
-            ))}
-          </select>
-        </label>
-      </section>
-      <form className="settings-grid admin-section-card" onSubmit={save}>
-        <div className="provider-form-head">
-          <div>
-            <h2>{editingProvider ? '编辑 LLM 配置' : '新增 LLM 配置'}</h2>
-            <p>{editingProvider ? `正在编辑 ${editingProvider.name}` : '配置 OpenAI-compatible 模型提供方。'}</p>
-          </div>
-          {editingProvider && (
-            <button className="text-btn" type="button" onClick={resetForm}>
-              取消编辑
-            </button>
-          )}
-        </div>
-        <input placeholder="名称" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
-        <input
-          placeholder="Base URL，例如 https://api.openai.com/v1"
-          value={form.base_url}
-          onChange={(event) => setForm({ ...form, base_url: event.target.value })}
-        />
-        <input
-          placeholder={editingProvider ? 'API Key，留空则不修改' : 'API Key'}
-          value={form.api_key}
-          onChange={(event) => setForm({ ...form, api_key: event.target.value })}
-        />
-        <input placeholder="模型，例如 gpt-4o-mini" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} />
-        <label className="field-block">
-          请求接口
-          <select value={form.request_mode} onChange={(event) => setForm({ ...form, request_mode: event.target.value })}>
-            <option value="chat_completions">chat/completions</option>
-            <option value="responses">responses</option>
-          </select>
-        </label>
-        <label className="field-block">
-          response_format
-          <textarea
-            rows={4}
-            placeholder='例如 {"type":"json_schema","json_schema":{"name":"demo","strict":true,"schema":{"type":"object","properties":{}}}}'
-            value={form.response_format}
-            onChange={(event) => setForm({ ...form, response_format: event.target.value })}
-          />
-        </label>
-        <p className="field-help">`responses` 模式会把这里的 JSON 原样透传到 `text.format`；`chat/completions` 会透传到 `response_format`。</p>
-        <div className="provider-flags">
-          <label>
-            <input type="checkbox" checked={form.is_default} onChange={(event) => setForm({ ...form, is_default: event.target.checked })} />
-            默认
-          </label>
-          <label>
-            <input type="checkbox" checked={form.is_visible} onChange={(event) => setForm({ ...form, is_visible: event.target.checked })} />
-            前台可见
-          </label>
-          <label>
-            <input type="checkbox" checked={form.is_active} onChange={(event) => setForm({ ...form, is_active: event.target.checked })} />
-            启用
-          </label>
-        </div>
-        {error && <div className="error-line">{error}</div>}
-        <div className="provider-form-actions">
-          <button className="primary-btn" type="submit">
-            {editingProvider ? '保存修改' : '保存 Provider'}
+          <button className="primary-btn" type="button" onClick={configureTitleProvider}>
+            <Settings size={16} />
+            配置标题 LLM
           </button>
-          {editingProvider && (
-            <button className="text-btn" type="button" onClick={resetForm}>
-              取消
-            </button>
-          )}
         </div>
-      </form>
+        <div className="admin-summary-list">
+          <div>
+            <span>标题生成模型</span>
+            <strong>{titleProvider ? `${titleProvider.name} · ${titleProvider.model}` : '未配置'}</strong>
+          </div>
+        </div>
+      </section>
       <section className="admin-section-card">
         <div className="provider-form-head">
           <div>
-            <h2>Provider 列表</h2>
-            <p>给前台模型选择、标题生成、记忆和工具使用的模型提供方都在这里统一维护。</p>
+            <h2>模型状态</h2>
+            <p>这里只显示前台聊天模型数量，内部功能模型已经拆到各自功能页单独配置。</p>
           </div>
         </div>
-        <div className="provider-list">
-        {providers.map((provider) => (
-          <div className="provider-card" key={provider.id}>
-            <div className="provider-card__head">
-              <div>
-                <strong>{provider.name}</strong>
-                <span>{provider.model}</span>
-              </div>
-              <div className="provider-card__actions">
-                <button className="icon-text-btn" type="button" onClick={() => editProvider(provider)}>
-                  <Edit3 size={15} />
-                  编辑
-                </button>
-                <button className="icon-text-btn danger" type="button" onClick={() => void deleteProvider(provider)}>
-                  <X size={15} />
-                  删除
-                </button>
-              </div>
-            </div>
-            <small>{provider.base_url}</small>
-            <div className="provider-badges">
-              <span>{provider.request_mode === 'responses' ? 'responses' : 'chat/completions'}</span>
-              {provider.is_default && <span>默认</span>}
-              {provider.is_visible ? <span>可见</span> : <span>隐藏</span>}
-              {provider.is_active ? <span>启用</span> : <span>停用</span>}
-            </div>
-            {provider.response_format && <small>{provider.response_format}</small>}
+        <div className="admin-summary-list admin-summary-list--compact">
+          <div>
+            <span>前台可见</span>
+            <strong>{visibleProviderCount} 个</strong>
           </div>
-        ))}
-        {!providers.length && <div className="empty-hint">暂无 Provider</div>}
+          <div>
+            <span>启用聊天模型</span>
+            <strong>{activeProviderCount} 个</strong>
+          </div>
+          <div>
+            <span>标题 LLM</span>
+            <strong>{titleProvider ? '已单独配置' : '未配置'}</strong>
+          </div>
         </div>
       </section>
+      {providerModalOpen && (
+        <Modal title={`配置${providerModalLabel}`} onClose={closeProviderModal} className="admin-modal-card">
+          <form className="settings-grid admin-modal-form" onSubmit={save}>
+            <div className="provider-form-head">
+              <div>
+                <h2>配置{providerModalLabel}</h2>
+                <p>{editingProvider ? `正在编辑 ${editingProvider.name}，API Key 留空时会沿用原来的密钥。` : '配置这个功能自己的 OpenAI-compatible 模型接口。'}</p>
+              </div>
+            </div>
+            <input placeholder="名称" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            <input
+              placeholder="Base URL，例如 https://api.openai.com/v1"
+              value={form.base_url}
+              onChange={(event) => setForm({ ...form, base_url: event.target.value })}
+            />
+            <input
+              placeholder={editingProvider ? 'API Key，留空则不修改' : 'API Key'}
+              value={form.api_key}
+              onChange={(event) => setForm({ ...form, api_key: event.target.value })}
+            />
+            <input placeholder="模型，例如 gpt-4o-mini" value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })} />
+            <label className="field-block">
+              请求接口
+              <select value={form.request_mode} onChange={(event) => setForm({ ...form, request_mode: event.target.value })}>
+                <option value="chat_completions">chat/completions</option>
+                <option value="responses">responses</option>
+              </select>
+            </label>
+            <label className="field-block">
+              response_format
+              <textarea
+                rows={4}
+                placeholder='例如 {"type":"json_schema","json_schema":{"name":"demo","strict":true,"schema":{"type":"object","properties":{}}}}'
+                value={form.response_format}
+                onChange={(event) => setForm({ ...form, response_format: event.target.value })}
+              />
+            </label>
+            {editingFeature === 'chat' ? (
+              <div className="provider-flags">
+                <label>
+                  <input type="checkbox" checked={form.is_default} onChange={(event) => setForm({ ...form, is_default: event.target.checked })} />
+                  默认
+                </label>
+                <label>
+                  <input type="checkbox" checked={form.is_visible} onChange={(event) => setForm({ ...form, is_visible: event.target.checked })} />
+                  前台可见
+                </label>
+                <label>
+                  <input type="checkbox" checked={form.is_active} onChange={(event) => setForm({ ...form, is_active: event.target.checked })} />
+                  启用
+                </label>
+              </div>
+            ) : null}
+            <p className="field-help">
+              {editingFeature === 'title'
+                ? '标题 LLM 会作为隐藏的功能专用配置保存，不会出现在前台模型选择里。'
+                : '这里是主聊天模型池，可以自由添加、切换默认或启停。'}
+            </p>
+            {error && <div className="error-line">{error}</div>}
+            <div className="provider-form-actions">
+              <button className="primary-btn" type="submit">
+                <Check size={16} />
+                保存配置
+              </button>
+              <button className="text-btn" type="button" onClick={closeProviderModal}>
+                取消
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 }

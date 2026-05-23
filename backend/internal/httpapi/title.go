@@ -18,9 +18,6 @@ const titleLLMMaxRunes = 18
 func (s *Server) titleProvider() (*runtimeProvider, error) {
 	id := int64(s.settingInt("title_provider_id", 0))
 	if id <= 0 {
-		id = int64(s.settingInt("memory_provider_id", 0))
-	}
-	if id <= 0 {
 		return nil, fmt.Errorf("title provider is not configured")
 	}
 	return s.getProviderByID(id)
