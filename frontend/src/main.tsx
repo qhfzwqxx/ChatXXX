@@ -3998,47 +3998,47 @@ function ProviderPanel({
         </div>
         <div className="provider-list provider-list--chat-models">
           {chatProviders.map((provider) => (
-            <div className="provider-card" key={provider.id}>
+            <div className="provider-card provider-card--chat-model" key={provider.id}>
               <div className="provider-card__head">
                 <div>
-                  <strong>{provider.name}</strong>
-                  <span>{provider.model}</span>
-                </div>
-                <div className="provider-card__actions">
-                  {!provider.is_default && (
-                    <button className="icon-text-btn" type="button" onClick={() => void setDefaultProvider(provider)}>
-                      <CircleCheck size={15} />
-                      设为默认
-                    </button>
-                  )}
-                  <button
-                    className="icon-text-btn"
-                    type="button"
-                    onClick={() => {
-                      setEditingFeature('chat');
-                      setEditingProviderId(provider.id);
-                      setError('');
-                      setForm(providerFormFromProvider(provider));
-                      setProviderModalOpen(true);
-                    }}
-                  >
-                    <Edit3 size={15} />
-                    编辑
-                  </button>
-                  <button className="icon-text-btn danger" type="button" onClick={() => void deleteProvider(provider)}>
-                    <X size={15} />
-                    删除
-                  </button>
+                  <strong title={provider.name}>{provider.name}</strong>
+                  <span title={provider.model}>{provider.model}</span>
                 </div>
               </div>
-              <small>{provider.base_url}</small>
+              <small title={provider.base_url}>{provider.base_url}</small>
               <div className="provider-badges">
                 <span>{provider.request_mode === 'responses' ? 'responses' : 'chat/completions'}</span>
                 {provider.is_default && <span>默认</span>}
                 {provider.is_visible ? <span>可见</span> : <span>隐藏</span>}
                 {provider.is_active ? <span>启用</span> : <span>停用</span>}
               </div>
-              {provider.response_format && <small>{provider.response_format}</small>}
+              {provider.response_format && <small title={provider.response_format}>{provider.response_format}</small>}
+              <div className={'provider-card__actions ' + (provider.is_default ? 'provider-card__actions--two' : 'provider-card__actions--three')}>
+                {!provider.is_default && (
+                  <button className="icon-text-btn provider-card__default-action" type="button" onClick={() => void setDefaultProvider(provider)}>
+                    <CircleCheck size={15} />
+                    设为默认
+                  </button>
+                )}
+                <button
+                  className="icon-text-btn"
+                  type="button"
+                  onClick={() => {
+                    setEditingFeature('chat');
+                    setEditingProviderId(provider.id);
+                    setError('');
+                    setForm(providerFormFromProvider(provider));
+                    setProviderModalOpen(true);
+                  }}
+                >
+                  <Edit3 size={15} />
+                  编辑
+                </button>
+                <button className="icon-text-btn danger" type="button" onClick={() => void deleteProvider(provider)}>
+                  <X size={15} />
+                  删除
+                </button>
+              </div>
             </div>
           ))}
           {!chatProviders.length && <div className="empty-hint">暂无主聊天模型</div>}
